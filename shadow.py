@@ -244,6 +244,7 @@ def start_server(voice: str, speed: float, provider: str):
         start_new_session=True,
     )
 
+    # With start_new_session=True, PGID == PID
     PID_FILE.write_text(str(proc.pid))
     print(f"✅ Shadow Companion started (PID {proc.pid})")
     print(f"   Voice: {voice} | Speed: {speed}x | Log: {log_file}")
@@ -252,18 +253,33 @@ def start_server(voice: str, speed: float, provider: str):
 def stop_server():
     if not is_server_running():
         print("Shadow Companion is not running.")
+        # Still clean up stale state
+        state = load_state()
+        state["running"] = False
+        save_state(state)
+        PID_FILE.unlink(missing_ok=True)
         sys.exit(0)
 
     pid = int(PID_FILE.read_text().strip())
     try:
-        os.kill(pid, signal.SIGTERM)
+        # Kill the whole process group (child + any subprocesses)
+        try:
+            os.killpg(pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            os.kill(pid, signal.SIGTERM)
         # Wait for process to die
-        for _ in range(10):
+        for _ in range(15):
             try:
                 os.kill(pid, 0)
                 time.sleep(0.3)
             except ProcessLookupError:
                 break
+        else:
+            # Force kill if still alive
+            try:
+                os.killpg(pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                os.kill(pid, signal.SIGKILL)
         print("✅ Shadow Companion stopped.")
     except ProcessLookupError:
         print("Process already gone.")
@@ -302,7 +318,11 @@ def _run_server():
     def handle_sigterm(sig, frame):
         companion.stop()
         PID_FILE.unlink(missing_ok=True)
-        sys.exit(0)
+        # Kill own process group to ensure all children die
+        try:
+            os.killpg(os.getpid(), signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            sys.exit(0)
 
     signal.signal(signal.SIGTERM, handle_sigterm)
     signal.signal(signal.SIGINT, handle_sigterm)
