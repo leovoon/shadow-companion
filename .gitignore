@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Shadow companion state
+.shadow-companion/
+
+# Raycast
+raycast-extension/node_modules/
+raycast-extension/dist/
+raycast-extension/.DS_Store
+
+# OS
+.DS_Store

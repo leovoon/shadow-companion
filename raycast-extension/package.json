@@ -1,0 +1,48 @@
+{
+  "$schema": "https://www.raycast.com/schemas/extension.json",
+  "name": "shadow-companion",
+  "title": "Shadow Companion",
+  "description": "Control Shadow Companion — TTS echo for language shadowing with Handy",
+  "icon": "extension-icon.png",
+  "author": "leovoon",
+  "categories": ["Productivity", "Education"],
+  "license": "MIT",
+  "commands": [
+    {
+      "name": "control",
+      "title": "Control Server",
+      "description": "Start, stop, or check status of Shadow Companion",
+      "mode": "view"
+    },
+    {
+      "name": "switch-voice",
+      "title": "Switch Voice",
+      "description": "Change the TTS voice for Shadow Companion",
+      "mode": "view"
+    },
+    {
+      "name": "adjust-speed",
+      "title": "Adjust Speed",
+      "description": "Change the speech speed multiplier",
+      "mode": "view"
+    }
+  ],
+  "dependencies": {
+    "@raycast/api": "^1.83.1",
+    "@raycast/utils": "^1.17.0"
+  },
+  "devDependencies": {
+    "@raycast/eslint-config": "^1.0.11",
+    "@types/node": "22.5.4",
+    "@types/react": "18.3.3",
+    "eslint": "^8.57.0",
+    "prettier": "^3.3.3",
+    "typescript": "^5.5.4"
+  },
+  "scripts": {
+    "build": "ray build --skip-types -e dist -o dist",
+    "dev": "ray develop",
+    "fix-lint": "ray lint --fix",
+    "lint": "ray lint"
+  }
+}
