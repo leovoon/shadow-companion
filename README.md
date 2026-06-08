@@ -1,4 +1,4 @@
-# Shadow Companion
+# 🦭 Shadow Companion
 
 TTS echo for language shadowing with [Handy](https://github.com/cjpais/Handy).
 
