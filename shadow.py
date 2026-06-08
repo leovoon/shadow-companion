@@ -118,14 +118,19 @@ class ShadowCompanion:
         import numpy as np
         import sounddevice as sd
         from pykokoro import KokoroPipeline, PipelineConfig
+        from pykokoro.generation_config import GenerationConfig
+        from dataclasses import replace as dc_replace
 
         self._np = np
         self._sd = sd
         self._KokoroPipeline = KokoroPipeline
         self._PipelineConfig = PipelineConfig
+        self._GenerationConfig = GenerationConfig
+        self._dc_replace = dc_replace
 
         print(f"Loading Kokoro model (voice={voice}, provider={provider})...")
         config = PipelineConfig(voice=voice, provider=provider)
+        config = dc_replace(config, generation=dc_replace(config.generation, speed=speed))
         self.pipe = KokoroPipeline(config)
         self.voice = voice
         self.speed = speed
@@ -158,7 +163,7 @@ class ShadowCompanion:
             if res.audio is None or len(res.audio) == 0:
                 print("  ⚠ no audio generated")
                 return
-            audio = self._np.array(res.audio, dtype=np.float32)
+            audio = self._np.array(res.audio, dtype=self._np.float32)
             duration = len(audio) / res.sample_rate
             self._sd.play(audio, res.sample_rate)
             self._sd.wait()
@@ -170,14 +175,21 @@ class ShadowCompanion:
         while self.running:
             # Hot-reload config
             state = load_state()
-            if state.get("voice") != self.voice:
-                print(f"  🔄 Voice changed: {self.voice} → {state['voice']}")
-                self.voice = state["voice"]
+            voice_changed = state.get("voice") != self.voice
+            speed_changed = state.get("speed") != self.speed
+
+            if voice_changed or speed_changed:
+                if voice_changed:
+                    print(f"  🔄 Voice changed: {self.voice} → {state['voice']}")
+                    self.voice = state["voice"]
+                if speed_changed:
+                    print(f"  🔄 Speed changed: {self.speed} → {state.get('speed', 1.0)}")
+                    self.speed = state.get("speed", 1.0)
+
                 config = self._PipelineConfig(voice=self.voice, provider=state.get("provider", "cpu"))
+                config = self._dc_replace(config, generation=self._dc_replace(config.generation, speed=self.speed))
                 self.pipe = self._KokoroPipeline(config)
-                print(f"  ✓ Voice updated\n")
-            if state.get("speed") != self.speed:
-                self.speed = state.get("speed", 1.0)
+                print(f"  ✓ Config updated\n")
 
             entries = get_new_entries(self.db_path, self.last_id)
             for entry in entries:
@@ -238,7 +250,7 @@ def start_server(voice: str, speed: float, provider: str):
     STATE_DIR.mkdir(parents=True, exist_ok=True)
 
     proc = subprocess.Popen(
-        [python, Path(__file__).resolve().as_posix(), "_run_server"],
+        [python, "-u", Path(__file__).resolve().as_posix(), "_run_server"],
         stdout=open(log_file, "a"),
         stderr=subprocess.STDOUT,
         start_new_session=True,

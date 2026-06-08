@@ -44,7 +44,7 @@ export function getState(): CompanionState {
 
 export function isRunning(): boolean {
   const result = runShadowCommand("status");
-  return result.includes("running");
+  return result.includes("🟢");
 }
 
 export const VOICES = [
