@@ -10,21 +10,22 @@ export default function Command() {
     try {
       const state = getState();
       setCurrentVoice(state.voice);
-      setServerRunning(isRunning());
     } catch {
       // defaults
     }
+    setServerRunning(isRunning());
   }, []);
 
   const handleSelect = async (voiceId: string) => {
-    const toast = await showToast({ style: Toast.Style.Animated, title: `Switching to ${voiceId}...` });
+    const voice = VOICES.find((v) => v.id === voiceId);
+    const toast = await showToast({ style: Toast.Style.Animated, title: `Switching to ${voice?.label || voiceId}...` });
     try {
       runShadowCommand("set-voice", voiceId);
       setCurrentVoice(voiceId);
       toast.style = Toast.Style.Success;
-      toast.title = `Voice set to ${voiceId}`;
+      toast.title = `🦭 Voice → ${voice?.label || voiceId}`;
       if (serverRunning) {
-        toast.message = "Will hot-reload on next poll";
+        toast.message = "Hot-reloads instantly via kqueue";
       }
     } catch (e) {
       toast.style = Toast.Style.Failure;

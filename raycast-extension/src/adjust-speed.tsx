@@ -3,7 +3,7 @@ import { useState, useEffect } from "react";
 import { runShadowCommand, getState } from "./lib";
 
 const SPEED_OPTIONS = [
-  { value: 0.7, label: "0.7x — Very Slow", desc: "For careful pronunciation practice" },
+  { value: 0.7, label: "0.7x — Very Slow", desc: "Careful pronunciation practice" },
   { value: 0.8, label: "0.8x — Slow", desc: "Good for shadowing beginners" },
   { value: 0.85, label: "0.85x — Slightly Slow", desc: "Comfortable shadowing pace" },
   { value: 0.9, label: "0.9x — Near Normal", desc: "Slightly easier to follow" },
@@ -31,7 +31,7 @@ export default function Command() {
       runShadowCommand("set-speed", String(speed));
       setCurrentSpeed(speed);
       toast.style = Toast.Style.Success;
-      toast.title = `Speed set to ${speed}x`;
+      toast.title = `🦭 Speed → ${speed}x`;
     } catch (e) {
       toast.style = Toast.Style.Failure;
       toast.title = "Failed to set speed";

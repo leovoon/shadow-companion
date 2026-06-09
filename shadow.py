@@ -32,7 +32,7 @@ VOICE_LIST = [
     "am_puck", "am_echo", "am_fenrir",
 ]
 
-POLL_S = 0.5
+POLL_S = 0.1  # Fallback poll interval (kqueue used when available)
 
 
 # Server state file
@@ -118,26 +118,47 @@ class ShadowCompanion:
     def __init__(self, voice: str, speed: float, provider: str, db_path: Path):
         import numpy as np
         import sounddevice as sd
-        from pykokoro import KokoroPipeline, PipelineConfig
+        from pykokoro import build_pipeline, PipelineConfig
         from pykokoro.generation_config import GenerationConfig
+        from pykokoro.stages.doc_parsers.ssmd import SsmdDocumentParser
+        from pykokoro.stages.g2p.kokorog2p import KokoroG2PAdapter
+        from pykokoro.stages.phoneme_processing.onnx import OnnxPhonemeProcessorAdapter
+        from pykokoro.stages.audio_generation.onnx import OnnxAudioGenerationAdapter
+        from pykokoro.stages.audio_postprocessing.onnx import OnnxAudioPostprocessingAdapter
+        from pykokoro.runtime.tracing import Trace
+        from pykokoro.constants import SAMPLE_RATE
+        from pykokoro.types import Segment
         from dataclasses import replace as dc_replace
 
         self._np = np
         self._sd = sd
-        self._KokoroPipeline = KokoroPipeline
+        self._build_pipeline = build_pipeline
         self._PipelineConfig = PipelineConfig
-        self._GenerationConfig = GenerationConfig
         self._dc_replace = dc_replace
+        self._SsmdDocumentParser = SsmdDocumentParser
+        self._KokoroG2PAdapter = KokoroG2PAdapter
+        self._OnnxPhonemeProcessorAdapter = OnnxPhonemeProcessorAdapter
+        self._OnnxAudioGenerationAdapter = OnnxAudioGenerationAdapter
+        self._OnnxAudioPostprocessingAdapter = OnnxAudioPostprocessingAdapter
+        self._Trace = Trace
+        self._SAMPLE_RATE = SAMPLE_RATE
+        self._Segment = Segment
 
         print(f"Loading Kokoro model (voice={voice}, provider={provider})...")
-        config = PipelineConfig(voice=voice, provider=provider)
-        config = dc_replace(config, generation=dc_replace(config.generation, speed=speed))
-        self.pipe = KokoroPipeline(config)
+        self.pipe = build_pipeline(
+            config={"voice": voice, "provider": provider, "generation": {"speed": speed}},
+            eager=True,
+        )
         self.voice = voice
         self.speed = speed
+        self.provider = provider
         self.db_path = db_path
         self.last_id = get_latest_entry_id(db_path)
         self.running = True
+
+        # Pre-warm: generate a short phrase so ONNX session is fully initialized
+        print("Pre-warming TTS engine...")
+        self.pipe.run("Ready.")
 
         # Save running state
         state = load_state()
@@ -151,7 +172,13 @@ class ShadowCompanion:
         print(f"Ready. Speak into Handy — your words will be spoken back.")
         print(f"Voice: {voice} | Speed: {speed}x | Provider: {provider} | Ctrl+C to quit\n")
 
-    def speak(self, text: str):
+    def speak_streaming(self, text: str):
+        """Generate and play audio segment-by-segment for lower latency.
+
+        For single-sentence input, falls back to pipe.run() (simpler, same speed).
+        For multi-sentence input, streams each segment — first sound plays
+        as soon as the first sentence is generated instead of waiting for all.
+        """
         text = text.strip()
         if not text:
             return
@@ -159,18 +186,65 @@ class ShadowCompanion:
             text = text[:500] + "..."
             print(f"  ⚠ truncated to 500 chars")
         print(f"  ▶ {text[:80]}{'...' if len(text) > 80 else ''}")
+
         for attempt in range(3):
             try:
-                res = self.pipe.run(text)
-                if res.audio is None or len(res.audio) == 0:
-                    print("  ⚠ no audio generated")
+                config = self.pipe.config
+                trace = self._Trace()
+
+                # Stage 1: Parse + Phonemize (fast, ~10ms)
+                doc = self._SsmdDocumentParser().parse(text, config, trace)
+                segments = doc.segments
+                if not segments and doc.clean_text:
+                    segments = [self._Segment(
+                        id="p0_s0_c0_seg0", text=doc.clean_text,
+                        char_start=0, char_end=len(doc.clean_text),
+                        paragraph_idx=0, sentence_idx=0, clause_idx=0,
+                    )]
+                phoneme_segments = self._KokoroG2PAdapter().phonemize(
+                    segments, doc, config, trace
+                )
+
+                # Fast path: single segment → use pipe.run() (avoids adapter overhead)
+                if len(phoneme_segments) <= 1:
+                    res = self.pipe.run(text)
+                    if res.audio is None or len(res.audio) == 0:
+                        print("  ⚠ no audio generated\n")
+                        return
+                    audio = res.audio.astype(self._np.float32) if hasattr(res.audio, 'astype') else self._np.array(res.audio, dtype=self._np.float32)
+                    duration = len(audio) / res.sample_rate
+                    self._sd.play(audio, res.sample_rate)
+                    self._sd.wait()
+                    print(f"  ✓ {duration:.1f}s played\n")
                     return
-                audio = res.audio.astype(self._np.float32) if hasattr(res.audio, 'astype') else self._np.array(res.audio, dtype=self._np.float32)
-                duration = len(audio) / res.sample_rate
-                self._sd.play(audio, res.sample_rate)
+
+                # Streaming path: multiple segments → play each as generated
+                kokoro, _ = self.pipe._ensure_kokoro(config)
+                pp = self._OnnxPhonemeProcessorAdapter(kokoro)
+                phoneme_segments = pp.process(phoneme_segments, config, trace)
+
+                ag = self._OnnxAudioGenerationAdapter(kokoro)
+                ap = self._OnnxAudioPostprocessingAdapter(kokoro)
+
+                total_duration = 0.0
+                for seg in phoneme_segments:
+                    seg_result = ag.generate([seg], config, trace)
+                    audio = ap.postprocess(seg_result, config, trace)
+                    if audio is not None and len(audio) > 0:
+                        audio_f32 = audio.astype(self._np.float32)
+                        dur = len(audio_f32) / self._SAMPLE_RATE
+                        total_duration += dur
+                        # Wait for previous segment before playing next
+                        self._sd.wait()
+                        self._sd.play(audio_f32, self._SAMPLE_RATE)
+
                 self._sd.wait()
-                print(f"  ✓ {duration:.1f}s played\n")
+                if total_duration > 0:
+                    print(f"  ✓ {total_duration:.1f}s played\n")
+                else:
+                    print("  ⚠ no audio generated\n")
                 return
+
             except Exception as e:
                 if attempt < 2 and ('PortAudio' in str(e) or '-9986' in str(e)):
                     print(f"  ⚠ Audio device error, retrying ({attempt + 1}/3)...")
@@ -180,36 +254,97 @@ class ShadowCompanion:
                 print(f"  ✗ TTS error: {e}\n")
                 return
 
-    def run(self):
+    def _watch_db_kqueue(self):
+        """Watch DB for changes using kqueue (macOS native, zero-polling-delay)."""
+        import select
+        import os
+
         while self.running:
             # Hot-reload config
-            state = load_state()
-            voice_changed = state.get("voice") != self.voice
-            speed_changed = state.get("speed") != self.speed
+            self._check_config_reload()
 
-            if voice_changed or speed_changed:
-                if voice_changed:
-                    print(f"  🔄 Voice changed: {self.voice} → {state['voice']}")
-                    self.voice = state["voice"]
-                if speed_changed:
-                    print(f"  🔄 Speed changed: {self.speed} → {state.get('speed', 1.0)}")
-                    self.speed = state.get("speed", 1.0)
+            # Check for new entries first
+            entries = get_new_entries(self.db_path, self.last_id)
+            for entry in entries:
+                if not self.running:
+                    return
+                text = entry.get("post_processed_text") or entry.get("transcription_text", "")
+                if text.strip():
+                    self.speak_streaming(text.strip())
+                self.last_id = entry["id"]
 
-                config = self._PipelineConfig(voice=self.voice, provider=state.get("provider", "cpu"))
-                config = self._dc_replace(config, generation=self._dc_replace(config.generation, speed=self.speed))
-                self.pipe = self._KokoroPipeline(config)
-                print(f"  ✓ Config updated\n")
+            # Wait for DB change via kqueue
+            try:
+                kq = select.kqueue()
+                fd = os.open(str(self.db_path), os.O_RDONLY)
+                kev = select.kevent(
+                    fd,
+                    filter=select.KQ_FILTER_VNODE,
+                    flags=select.KQ_EV_ADD | select.KQ_EV_ENABLE | select.KQ_EV_CLEAR,
+                    fflags=select.KQ_NOTE_WRITE | select.KQ_NOTE_EXTEND,
+                )
+                # Block until DB changes or timeout (for config hot-reload)
+                events = kq.control([kev], 1, 2.0)
+                kq.close()
+                os.close(fd)
+                if events:
+                    # Small sleep to let Handy finish writing
+                    time.sleep(0.05)
+            except (OSError, FileNotFoundError):
+                # DB file might have been recreated — fall back to polling
+                time.sleep(POLL_S)
+
+    def _watch_db_poll(self):
+        """Watch DB for changes using polling (fallback)."""
+        while self.running:
+            self._check_config_reload()
 
             entries = get_new_entries(self.db_path, self.last_id)
             for entry in entries:
                 if not self.running:
-                    break
+                    return
                 text = entry.get("post_processed_text") or entry.get("transcription_text", "")
                 if text.strip():
-                    self.speak(text.strip())
+                    self.speak_streaming(text.strip())
                 self.last_id = entry["id"]
 
             time.sleep(POLL_S)
+
+    def _check_config_reload(self):
+        """Hot-reload voice/speed from state file if changed."""
+        state = load_state()
+        voice_changed = state.get("voice") != self.voice
+        speed_changed = state.get("speed") != self.speed
+
+        if voice_changed or speed_changed:
+            if voice_changed:
+                print(f"  🔄 Voice changed: {self.voice} → {state['voice']}")
+                self.voice = state["voice"]
+            if speed_changed:
+                print(f"  🔄 Speed changed: {self.speed} → {state.get('speed', 1.0)}")
+                self.speed = state.get("speed", 1.0)
+
+            self.pipe = self._build_pipeline(
+                config={
+                    "voice": self.voice,
+                    "provider": state.get("provider", self.provider),
+                    "generation": {"speed": self.speed},
+                },
+                eager=True,
+            )
+            print(f"  ✓ Config updated\n")
+
+    def run(self):
+        """Start watching DB — uses kqueue if available, else polling."""
+        try:
+            import select
+            if hasattr(select, 'kqueue') and hasattr(select, 'KQ_FILTER_VNODE'):
+                print("  Using kqueue for DB watching (instant detection)")
+                self._watch_db_kqueue()
+            else:
+                self._watch_db_poll()
+        except ImportError:
+            self._watch_db_poll()
 
     def stop(self):
         self.running = False

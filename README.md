@@ -66,10 +66,19 @@ Three commands available:
 
 ## Latency on M2
 
-With CPU provider, Kokoro runs at **3-4× realtime** after warmup. A typical sentence (2-3s of audio) generates in ~0.5-0.8s. Total loop:
+With CPU provider, Kokoro runs at **4-5× realtime** after warmup. Typical sentence (2-3s of audio) generates in ~0.5-0.8s. The companion uses multiple optimizations:
+
+- **kqueue file watching** — instant DB change detection instead of polling
+- **Segment streaming** — first sentence plays while subsequent sentences are still generating
+- **Eager pipeline + pre-warm** — ONNX session ready before first speech event
+- **Fast path for short input** — single-sentence goes through simpler pipe.run()
+
+Total loop:
 - You speak → Handy transcribes (~1-3s)
-- DB poll → Kokoro generates (~0.5-1s)
-- Audio plays → you shadow
+- DB change detected → Kokoro generates first segment (~0.3-0.5s)
+- Audio plays → remaining segments stream → you shadow
+
+**CoreML is slower** on M2 because only ~45% of Kokoro's ONNX nodes are supported, causing graph partitioning overhead. CPU wins.
 
 ## Available English voices
 
@@ -84,7 +93,7 @@ With CPU provider, Kokoro runs at **3-4× realtime** after warmup. A typical sen
 
 ## Troubleshooting
 
-**CoreML slow on M2:** Use `--provider cpu` (default) — it's actually faster (~3-4× realtime vs 0.3× with CoreML) because CoreML only supports ~45% of Kokoro's ONNX nodes.
+**CoreML slow on M2:** Use `--provider cpu` (default) — it's actually faster (~4-5× realtime) because CoreML only supports ~45% of Kokoro's ONNX nodes, causing graph partitioning overhead.
 
 **"Could not find Handy's history.db":** Make sure Handy is installed and has been used at least once. Or specify the path: `python shadow.py --db /path/to/history.db`
 
