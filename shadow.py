@@ -33,7 +33,7 @@ VOICE_LIST = [
 ]
 
 POLL_S = 0.5
-DEBOUNCE_S = 1.5  # Wait for Handy transcription to settle
+
 
 # Server state file
 STATE_DIR = Path.home() / ".shadow-companion"
@@ -201,26 +201,13 @@ class ShadowCompanion:
                 print(f"  ✓ Config updated\n")
 
             entries = get_new_entries(self.db_path, self.last_id)
-            if entries:
-                # Debounce: wait for Handy transcription to settle
-                # Handy writes partials rapidly; only speak the last one
-                seen_max_id = entries[-1]["id"]
-                while self.running:
-                    time.sleep(DEBOUNCE_S)
-                    newer = get_new_entries(self.db_path, seen_max_id)
-                    if not newer:
-                        break
-                    entries = newer  # Keep only latest batch
-                    seen_max_id = newer[-1]["id"]
-
-                # Speak only the final settled entry
-                if entries and self.running:
-                    final = entries[-1]
-                    text = final.get("post_processed_text") or final.get("transcription_text", "")
-                    if text.strip():
-                        self.speak(text.strip())
-                    # Skip all entries (even if we only spoke the last)
-                    self.last_id = seen_max_id
+            for entry in entries:
+                if not self.running:
+                    break
+                text = entry.get("post_processed_text") or entry.get("transcription_text", "")
+                if text.strip():
+                    self.speak(text.strip())
+                self.last_id = entry["id"]
 
             time.sleep(POLL_S)
 
