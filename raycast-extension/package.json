@@ -3,7 +3,7 @@
   "name": "shadow-companion",
   "title": "Shadow Companion",
   "description": "Control Shadow Companion — TTS echo for language shadowing with Handy",
-  "icon": "extension-icon.png",
+  "icon": "🦭",
   "author": "leovoon",
   "categories": ["Productivity", "Education"],
   "license": "MIT",
@@ -12,19 +12,22 @@
       "name": "control",
       "title": "Control Server",
       "description": "Start, stop, or check status of Shadow Companion",
-      "mode": "view"
+      "mode": "view",
+      "icon": "🦭"
     },
     {
       "name": "switch-voice",
       "title": "Switch Voice",
       "description": "Change the TTS voice for Shadow Companion",
-      "mode": "view"
+      "mode": "view",
+      "icon": "🦭"
     },
     {
       "name": "adjust-speed",
       "title": "Adjust Speed",
       "description": "Change the speech speed multiplier",
-      "mode": "view"
+      "mode": "view",
+      "icon": "🦭"
     }
   ],
   "dependencies": {
