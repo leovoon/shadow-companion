@@ -33,6 +33,7 @@ VOICE_LIST = [
 ]
 
 POLL_S = 0.5
+DEBOUNCE_S = 1.5  # Wait for Handy transcription to settle
 
 # Server state file
 STATE_DIR = Path.home() / ".shadow-companion"
@@ -158,18 +159,26 @@ class ShadowCompanion:
             text = text[:500] + "..."
             print(f"  ⚠ truncated to 500 chars")
         print(f"  ▶ {text[:80]}{'...' if len(text) > 80 else ''}")
-        try:
-            res = self.pipe.run(text)
-            if res.audio is None or len(res.audio) == 0:
-                print("  ⚠ no audio generated")
+        for attempt in range(3):
+            try:
+                res = self.pipe.run(text)
+                if res.audio is None or len(res.audio) == 0:
+                    print("  ⚠ no audio generated")
+                    return
+                audio = res.audio.astype(self._np.float32) if hasattr(res.audio, 'astype') else self._np.array(res.audio, dtype=self._np.float32)
+                duration = len(audio) / res.sample_rate
+                self._sd.play(audio, res.sample_rate)
+                self._sd.wait()
+                print(f"  ✓ {duration:.1f}s played\n")
                 return
-            audio = self._np.array(res.audio, dtype=self._np.float32)
-            duration = len(audio) / res.sample_rate
-            self._sd.play(audio, res.sample_rate)
-            self._sd.wait()
-            print(f"  ✓ {duration:.1f}s played\n")
-        except Exception as e:
-            print(f"  ✗ TTS error: {e}\n")
+            except Exception as e:
+                if attempt < 2 and ('PortAudio' in str(e) or '-9986' in str(e)):
+                    print(f"  ⚠ Audio device error, retrying ({attempt + 1}/3)...")
+                    self._sd.stop()
+                    time.sleep(0.5)
+                    continue
+                print(f"  ✗ TTS error: {e}\n")
+                return
 
     def run(self):
         while self.running:
@@ -192,13 +201,26 @@ class ShadowCompanion:
                 print(f"  ✓ Config updated\n")
 
             entries = get_new_entries(self.db_path, self.last_id)
-            for entry in entries:
-                if not self.running:
-                    break
-                text = entry.get("post_processed_text") or entry.get("transcription_text", "")
-                if text.strip():
-                    self.speak(text.strip())
-                self.last_id = entry["id"]
+            if entries:
+                # Debounce: wait for Handy transcription to settle
+                # Handy writes partials rapidly; only speak the last one
+                seen_max_id = entries[-1]["id"]
+                while self.running:
+                    time.sleep(DEBOUNCE_S)
+                    newer = get_new_entries(self.db_path, seen_max_id)
+                    if not newer:
+                        break
+                    entries = newer  # Keep only latest batch
+                    seen_max_id = newer[-1]["id"]
+
+                # Speak only the final settled entry
+                if entries and self.running:
+                    final = entries[-1]
+                    text = final.get("post_processed_text") or final.get("transcription_text", "")
+                    if text.strip():
+                        self.speak(text.strip())
+                    # Skip all entries (even if we only spoke the last)
+                    self.last_id = seen_max_id
 
             time.sleep(POLL_S)
 
