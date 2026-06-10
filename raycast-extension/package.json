@@ -26,9 +26,16 @@
       "icon": "🦭.png"
     },
     {
+      "name": "switch-provider",
+      "title": "Switch Provider",
+      "description": "Switch between Kokoro (built-in voices) and NeuTTS (voice cloning)",
+      "mode": "view",
+      "icon": "🦭.png"
+    },
+    {
       "name": "adjust-speed",
       "title": "Adjust Speed",
-      "description": "Change the speech speed multiplier",
+      "description": "Change the speech speed multiplier (Kokoro only)",
       "mode": "view",
       "icon": "🦭.png"
     }

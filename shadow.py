@@ -1,17 +1,23 @@
 #!/usr/bin/env python3
 """
 Shadow Companion — watches Handy's transcription history database,
-speaks new entries back with Kokoro TTS so you can shadow native intonation.
+speaks new entries back with TTS so you can shadow native intonation.
+
+Supports two TTS providers:
+  kokoro  — Kokoro TTS (built-in voices, adjustable speed)
+  neutts  — NeuTTS Air (voice cloning, requires reference audio)
 
 Usage:
-    python shadow.py [--voice VOICE] [--speed SPEED] [--provider PROVIDER]
+    python shadow.py [--voice VOICE] [--speed SPEED] [--provider kokoro|neutts]
 
 Server mode (for Raycast/CLI control):
     python shadow.py serve                    # start as background server
     python shadow.py stop                     # stop running server
     python shadow.py status                   # check if server is running
-    python shadow.py set-voice <voice>        # change voice (hot-reloads)
-    python shadow.py set-speed <speed>        # change speed
+    python shadow.py set-voice <voice>        # change voice (hot-reloads, kokoro only)
+    python shadow.py set-speed <speed>        # change speed (kokoro only)
+    python shadow.py set-provider <provider>  # change TTS engine (requires restart)
+    python shadow.py setup-voice              # record reference audio for NeuTTS
 """
 
 import argparse
@@ -40,6 +46,11 @@ STATE_DIR = Path.home() / ".shadow-companion"
 STATE_FILE = STATE_DIR / "state.json"
 PID_FILE = STATE_DIR / "server.pid"
 DAILY_PROGRESS_FILE = STATE_DIR / "daily-progress.json"
+TTS_PLAY_LOG = STATE_DIR / "tts-play-log.json"
+
+# NeuTTS reference voice defaults
+REF_VOICE_WAV = STATE_DIR / "my-voice.wav"
+REF_VOICE_TXT = STATE_DIR / "my-voice.txt"
 
 # Default daily target in seconds (60 minutes)
 DEFAULT_DAILY_TARGET_S = 3600
@@ -82,6 +93,38 @@ def wav_duration(path: Path) -> float:
             return frames / rate if rate > 0 else 0.0
     except Exception:
         return 0.0
+
+
+def log_tts_play(duration_s: float):
+    """Append TTS playback duration to today's log."""
+    from datetime import date
+
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    log = {}
+    if TTS_PLAY_LOG.exists():
+        try:
+            log = json.loads(TTS_PLAY_LOG.read_text())
+        except (json.JSONDecodeError, ValueError):
+            log = {}
+
+    today = date.today().isoformat()
+    log[today] = round(log.get(today, 0.0) + duration_s, 1)
+    TTS_PLAY_LOG.write_text(json.dumps(log, indent=2))
+
+
+def compute_daily_tts_duration() -> float:
+    """Compute total TTS playback duration for today from the play log."""
+    from datetime import date
+
+    if not TTS_PLAY_LOG.exists():
+        return 0.0
+    try:
+        log = json.loads(TTS_PLAY_LOG.read_text())
+    except (json.JSONDecodeError, ValueError):
+        return 0.0
+
+    today = date.today().isoformat()
+    return log.get(today, 0.0)
 
 
 def compute_daily_stt_duration(db_path: Path) -> float:
@@ -129,22 +172,24 @@ def compute_daily_stt_duration(db_path: Path) -> float:
 
 
 def write_daily_progress(db_path: Path | None = None):
-    """Write ~/.shadow-companion/daily-progress.json for Perry menubar app."""
+    """Write ~/.shadow-companion/daily-progress.json for Perry menubar app.
+
+    Primary metric is TTS playback duration (how long you spent listening/shadowing).
+    STT recording duration is included as a secondary field for reference.
+    """
     from datetime import date
 
-    if db_path is None:
-        db_path = find_handy_db()
-    if db_path is None:
-        return
+    tts_seconds = compute_daily_tts_duration()
+    stt_seconds = compute_daily_stt_duration(db_path) if db_path else 0.0
 
-    actual_seconds = compute_daily_stt_duration(db_path)
     state = load_state()
     target_seconds = state.get("daily_target_s", DEFAULT_DAILY_TARGET_S)
-    progress = min(1.0, actual_seconds / target_seconds) if target_seconds > 0 else 0.0
+    progress = min(1.0, tts_seconds / target_seconds) if target_seconds > 0 else 0.0
 
     progress_data = {
         "date": date.today().isoformat(),
-        "actual_seconds": round(actual_seconds, 1),
+        "actual_seconds": round(tts_seconds, 1),
+        "stt_seconds": round(stt_seconds, 1),
         "target_seconds": target_seconds,
         "progress": round(progress, 4),
     }
@@ -210,13 +255,17 @@ def _verify_progress():
             missing += 1
         print(f"  {r['file_name']}  {dur:>6.1f}s  {exists}  \"{text_preview}...\"")
 
-    progress = min(1.0, total / target_s) if target_s > 0 else 0.0
+    # TTS playback duration (primary metric)
+    tts_seconds = compute_daily_tts_duration()
+
     print()
-    print(f"Total:   {total:.1f}s ({total / 60:.1f} min)")
-    print(f"Target:  {target_s}s ({target_s // 60} min)")
-    print(f"Progress: {progress:.4f} ({progress * 100:.1f}%)")
+    print(f"STT duration:  {total:.1f}s ({total / 60:.1f} min) — time you spoke into Handy")
+    print(f"TTS duration:  {tts_seconds:.1f}s ({tts_seconds / 60:.1f} min) — time you spent listening/shadowing")
+    print(f"Target:        {target_s}s ({target_s // 60} min)")
+    progress = min(1.0, tts_seconds / target_s) if target_s > 0 else 0.0
+    print(f"Progress:      {progress:.4f} ({progress * 100:.1f}%) — based on TTS playback")
     if missing:
-        print(f"⚠  {missing} WAV file(s) missing — durations not counted")
+        print(f"⚠  {missing} WAV file(s) missing — STT durations not counted")
 
     # Cross-check with daily-progress.json
     if DAILY_PROGRESS_FILE.exists():
@@ -224,11 +273,10 @@ def _verify_progress():
         print()
         print(f"daily-progress.json:")
         print(f"  date:            {data.get('date')}")
-        print(f"  actual_seconds:  {data.get('actual_seconds')}")
+        print(f"  actual_seconds:  {data.get('actual_seconds')} (TTS playback)")
+        print(f"  stt_seconds:     {data.get('stt_seconds', 'N/A')} (STT recording)")
         print(f"  target_seconds:  {data.get('target_seconds')}")
         print(f"  progress:        {data.get('progress')}")
-        if abs(data.get('actual_seconds', 0) - total) > 0.5:
-            print(f"  ⚠ JSON stale — recompute with: python shadow.py progress")
     else:
         print("\n⚠ No daily-progress.json found — run: python shadow.py progress")
 
@@ -291,9 +339,45 @@ def get_new_entries(db_path: Path, since_id: int) -> list[dict]:
 # ── TTS ───────────────────────────────────────────────────────────
 
 class ShadowCompanion:
-    def __init__(self, voice: str, speed: float, provider: str, db_path: Path):
+    def __init__(self, voice: str, speed: float, provider: str, db_path: Path,
+                 ref_audio: Path | None = None, ref_text: str | None = None):
         import numpy as np
         import sounddevice as sd
+
+        self._np = np
+        self._sd = sd
+        self.voice = voice
+        self.speed = speed
+        self.provider = provider
+        self.db_path = db_path
+        self.last_id = get_latest_entry_id(db_path)
+        self.running = True
+
+        # Provider-specific initialization
+        if provider == "kokoro":
+            self._init_kokoro(voice, speed, provider)
+        elif provider == "neutts":
+            self._init_neutts(ref_audio, ref_text)
+        else:
+            print(f"❌ Unknown provider: {provider}. Use 'kokoro' or 'neutts'.")
+            sys.exit(1)
+
+        # Save running state
+        state = load_state()
+        state["running"] = True
+        state["voice"] = voice
+        state["speed"] = speed
+        state["provider"] = provider
+        save_state(state)
+
+        print(f"Watching: {db_path}")
+        print(f"Ready. Speak into Handy — your words will be spoken back.")
+        if provider == "kokoro":
+            print(f"Voice: {voice} | Speed: {speed}x | Provider: {provider} | Ctrl+C to quit\n")
+        else:
+            print(f"Provider: {provider} (cloning your voice) | Ctrl+C to quit\n")
+
+    def _init_kokoro(self, voice: str, speed: float, provider: str):
         from pykokoro import build_pipeline, PipelineConfig
         from pykokoro.generation_config import GenerationConfig
         from pykokoro.stages.doc_parsers.ssmd import SsmdDocumentParser
@@ -306,8 +390,6 @@ class ShadowCompanion:
         from pykokoro.types import Segment
         from dataclasses import replace as dc_replace
 
-        self._np = np
-        self._sd = sd
         self._build_pipeline = build_pipeline
         self._PipelineConfig = PipelineConfig
         self._dc_replace = dc_replace
@@ -325,36 +407,56 @@ class ShadowCompanion:
             config={"voice": voice, "provider": provider, "generation": {"speed": speed}},
             eager=True,
         )
-        self.voice = voice
-        self.speed = speed
-        self.provider = provider
-        self.db_path = db_path
-        self.last_id = get_latest_entry_id(db_path)
-        self.running = True
 
         # Pre-warm: generate a short phrase so ONNX session is fully initialized
         print("Pre-warming TTS engine...")
         self.pipe.run("Ready.")
 
-        # Save running state
-        state = load_state()
-        state["running"] = True
-        state["voice"] = voice
-        state["speed"] = speed
-        state["provider"] = provider
-        save_state(state)
+    def _init_neutts(self, ref_audio: Path | None, ref_text: str | None):
+        from neutts import NeuTTS
+        import soundfile as sf
 
-        print(f"Watching: {db_path}")
-        print(f"Ready. Speak into Handy — your words will be spoken back.")
-        print(f"Voice: {voice} | Speed: {speed}x | Provider: {provider} | Ctrl+C to quit\n")
+        # Resolve reference audio/text
+        ref_audio = ref_audio or REF_VOICE_WAV
+        ref_text_path = REF_VOICE_TXT if ref_text is None else None
+
+        if not ref_audio.exists():
+            print(f"❌ No reference audio found at {ref_audio}")
+            print(f"   Run: python shadow.py setup-voice")
+            print(f"   Or place a 3-15 second .wav file at {REF_VOICE_WAV}")
+            print(f"   with a matching transcript at {REF_VOICE_TXT}")
+            sys.exit(1)
+
+        # Load reference text
+        if ref_text is None:
+            if ref_text_path and ref_text_path.exists():
+                ref_text = ref_text_path.read_text().strip()
+            else:
+                print(f"❌ No reference text found at {ref_text_path}")
+                print(f"   Create {REF_VOICE_TXT} with the transcript of your reference audio.")
+                sys.exit(1)
+
+        print(f"Loading NeuTTS Air Q8 model...")
+        self._neutts = NeuTTS(
+            backbone_repo="neuphonic/neutts-air-q8-gguf",
+            backbone_device="cpu",
+            codec_repo="neuphonic/neucodec",
+            codec_device="cpu",
+        )
+        self._sf = sf
+        self._ref_audio_path = str(ref_audio)
+        self._ref_text = ref_text
+
+        print("Encoding reference audio...")
+        self._ref_codes = self._neutts.encode_reference(self._ref_audio_path)
+
+        # Pre-warm
+        print("Pre-warming TTS engine...")
+        wav = self._neutts.infer("Ready.", self._ref_codes, self._ref_text)
+        print(f"NeuTTS ready (ref: {ref_audio.name}, {len(ref_text)} chars)")
 
     def speak_streaming(self, text: str):
-        """Generate and play audio segment-by-segment for lower latency.
-
-        For single-sentence input, falls back to pipe.run() (simpler, same speed).
-        For multi-sentence input, streams each segment — first sound plays
-        as soon as the first sentence is generated instead of waiting for all.
-        """
+        """Generate and play audio segment-by-segment for lower latency."""
         text = text.strip()
         if not text:
             return
@@ -363,6 +465,13 @@ class ShadowCompanion:
             print(f"  ⚠ truncated to 500 chars")
         print(f"  ▶ {text[:80]}{'...' if len(text) > 80 else ''}")
 
+        if self.provider == "kokoro":
+            self._speak_kokoro(text)
+        elif self.provider == "neutts":
+            self._speak_neutts(text)
+
+    def _speak_kokoro(self, text: str):
+        """Kokoro streaming: segment-by-segment playback."""
         for attempt in range(3):
             try:
                 config = self.pipe.config
@@ -391,6 +500,7 @@ class ShadowCompanion:
                     duration = len(audio) / res.sample_rate
                     self._sd.play(audio, res.sample_rate)
                     self._sd.wait()
+                    log_tts_play(duration)
                     print(f"  ✓ {duration:.1f}s played\n")
                     return
 
@@ -416,6 +526,7 @@ class ShadowCompanion:
 
                 self._sd.wait()
                 if total_duration > 0:
+                    log_tts_play(total_duration)
                     print(f"  ✓ {total_duration:.1f}s played\n")
                 else:
                     print("  ⚠ no audio generated\n")
@@ -429,6 +540,100 @@ class ShadowCompanion:
                     continue
                 print(f"  ✗ TTS error: {e}\n")
                 return
+
+    def _speak_neutts(self, text: str):
+        """NeuTTS streaming: low-latency gapless playback via OutputStream callback.
+
+        Uses the same queue-based pattern as NeuTTS's official PyAudio example,
+        but with sounddevice.OutputStream callbacks instead — chunks flow from
+        infer_stream() → queue → callback → speakers with no gaps between chunks.
+        """
+        import queue as _queue
+        np = self._np
+
+        try:
+            sample_rate = self._neutts.sample_rate  # 24000
+            chunk_queue = _queue.Queue()
+
+            # Buffer state consumed only by the audio callback thread
+            buf = np.zeros(0, dtype=np.float32)
+            buf_offset = 0
+            got_sentinel = False
+
+            def _callback(outdata, frames, time_info, status):
+                """OutputStream callback: fills outdata from queued chunks."""
+                nonlocal buf, buf_offset, got_sentinel
+
+                if got_sentinel:
+                    outdata[:] = 0
+                    raise self._sd.CallbackStop
+
+                written = 0
+                while written < frames:
+                    # Drain current buffer first
+                    avail = len(buf) - buf_offset
+                    if avail > 0:
+                        n = min(avail, frames - written)
+                        outdata[written:written + n, 0] = buf[buf_offset:buf_offset + n]
+                        buf_offset += n
+                        written += n
+                    else:
+                        # Fetch next chunk from queue
+                        try:
+                            chunk = chunk_queue.get(timeout=2.0)
+                        except _queue.Empty:
+                            # Underrun — pad remaining with silence
+                            outdata[written:, 0] = 0.0
+                            return
+
+                        if chunk is None:  # sentinel = inference done
+                            got_sentinel = True
+                            outdata[written:, 0] = 0.0
+                            raise self._sd.CallbackStop
+
+                        buf = chunk
+                        buf_offset = 0
+
+            # Open OutputStream — callback starts consuming immediately
+            stream = self._sd.OutputStream(
+                samplerate=sample_rate,
+                channels=1,
+                dtype='float32',
+                callback=_callback,
+                blocksize=1024,  # ~43ms at 24kHz — low latency, safe from underruns
+            )
+            stream.start()
+
+            # Feed inference chunks into queue (first chunk plays almost immediately)
+            total_samples = 0
+            for chunk in self._neutts.infer_stream(text, self._ref_codes, self._ref_text):
+                if chunk is not None and len(chunk) > 0:
+                    audio = chunk.astype(np.float32)
+                    chunk_queue.put(audio)
+                    total_samples += len(audio)
+
+            # Tail padding (avoids cutting off final chunk) + sentinel
+            chunk_queue.put(np.zeros(int(0.15 * sample_rate), dtype=np.float32))
+            chunk_queue.put(None)  # signals callback to stop
+
+            # Wait for playback to finish
+            total_duration = total_samples / sample_rate
+            timeout = max(total_duration + 5, 10)
+            deadline = time.monotonic() + timeout
+            while stream.active and time.monotonic() < deadline:
+                time.sleep(0.05)
+
+            stream.stop()
+            stream.close()
+
+            if total_duration > 0:
+                log_tts_play(total_duration)
+                print(f"  ✓ {total_duration:.1f}s played\n")
+            else:
+                print("  ⚠ no audio generated\n")
+
+        except Exception as e:
+            print(f"  ✗ TTS error: {e}\n")
 
     def _watch_db_kqueue(self):
         """Watch DB for changes using kqueue (macOS native, zero-polling-delay)."""
@@ -495,8 +700,18 @@ class ShadowCompanion:
             time.sleep(POLL_S)
 
     def _check_config_reload(self):
-        """Hot-reload voice/speed from state file if changed."""
+        """Hot-reload voice/speed from state file if changed (Kokoro only)."""
         state = load_state()
+
+        # Provider changes require restart — skip hot-reload
+        if state.get("provider") != self.provider:
+            if state.get("provider") is not None:
+                print(f"  ⚠ Provider changed: {self.provider} → {state['provider']}. Restart required.")
+            return
+
+        if self.provider != "kokoro":
+            return
+
         voice_changed = state.get("voice") != self.voice
         speed_changed = state.get("speed") != self.speed
 
@@ -587,7 +802,10 @@ def start_server(voice: str, speed: float, provider: str):
     # With start_new_session=True, PGID == PID
     PID_FILE.write_text(str(proc.pid))
     print(f"✅ Shadow Companion started (PID {proc.pid})")
-    print(f"   Voice: {voice} | Speed: {speed}x | Log: {log_file}")
+    if provider == "neutts":
+        print(f"   Provider: {provider} (voice cloning) | Log: {log_file}")
+    else:
+        print(f"   Voice: {voice} | Speed: {speed}x | Log: {log_file}")
 
 
 def stop_server():
@@ -634,8 +852,13 @@ def server_status():
     if is_server_running():
         pid = int(PID_FILE.read_text().strip())
         state = load_state()
-        print(f"🟢 Shadow Companion is running (PID {pid})")
-        print(f"   Voice: {state.get('voice', 'am_michael')} | Speed: {state.get('speed', 1.0)}x")
+        provider = state.get('provider', 'kokoro')
+        if provider == 'neutts':
+            print(f"🟢 Shadow Companion is running (PID {pid})")
+            print(f"   Provider: {provider} (voice cloning)")
+        else:
+            print(f"🟢 Shadow Companion is running (PID {pid})")
+            print(f"   Voice: {state.get('voice', 'am_michael')} | Speed: {state.get('speed', 1.0)}x")
     else:
         print("🔴 Shadow Companion is not running.")
 
@@ -648,11 +871,14 @@ def _run_server():
         print("❌ Could not find Handy's history.db")
         sys.exit(1)
 
+    provider = state.get("provider", "kokoro")
     companion = ShadowCompanion(
         voice=state.get("voice", "am_michael"),
         speed=state.get("speed", 1.0),
-        provider=state.get("provider", "cpu"),
+        provider=provider,
         db_path=db_path,
+        ref_audio=REF_VOICE_WAV if provider == "neutts" else None,
+        ref_text=None,
     )
 
     # Write initial daily progress
@@ -672,6 +898,97 @@ def _run_server():
     companion.run()
 
 
+# ── NeuTTS voice setup ─────────────────────────────────────────────
+
+def _setup_voice():
+    """Interactive onboarding: record reference audio for voice cloning."""
+    import sounddevice as sd
+    import numpy as np
+
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+
+    print("🎙️  NeuTTS Voice Setup")
+    print("=" * 40)
+    print()
+    print("You'll record a short clip of your natural speaking voice.")
+    print("This will be used to clone your voice for TTS playback.")
+    print()
+    print("Tips for best results:")
+    print("  • Speak naturally, at your normal pace")
+    print("  • Use the language you'll be shadowing (English)")
+    print("  • 3-15 seconds, continuous speech, no long pauses")
+    print("  • Quiet environment")
+    print()
+
+    # Check if existing reference exists
+    if REF_VOICE_WAV.exists():
+        print(f"Existing reference found: {REF_VOICE_WAV}")
+        overwrite = input("Overwrite? [y/N] ").strip().lower()
+        if overwrite != 'y':
+            print("Keeping existing reference.")
+            return
+
+    # Get recording duration
+    print()
+    duration = input("Recording duration in seconds (5-15, default 10): ").strip()
+    try:
+        duration = max(3, min(15, int(duration)))
+    except ValueError:
+        duration = 10
+
+    # Countdown
+    print(f"\nRecording {duration}s of your voice...")
+    for i in range(3, 0, -1):
+        print(f"  {i}...")
+        time.sleep(1)
+    print("  🎙️  GO!")
+
+    # Record
+    sample_rate = 16000  # NeuTTS expects 16kHz for encode_reference
+    recording = sd.rec(int(duration * sample_rate), samplerate=sample_rate, channels=1, dtype='float32')
+    sd.wait()
+    print("  ✓ Recording complete.")
+
+    # Playback for verification
+    print("\nPlaying back your recording...")
+    sd.play(recording.flatten(), sample_rate)
+    sd.wait()
+
+    accept = input("\nUse this recording? [Y/n] ").strip().lower()
+    if accept == 'n':
+        print("Cancelled. Run setup-voice again to retry.")
+        return
+
+    # Save audio
+    import soundfile as sf
+    sf.write(str(REF_VOICE_WAV), recording.flatten(), sample_rate)
+    print(f"\n✅ Audio saved to {REF_VOICE_WAV}")
+
+    # Get reference text
+    print()
+    print("Now type exactly what you said in the recording.")
+    print("(This is needed by the model for voice cloning accuracy.)")
+    if REF_VOICE_TXT.exists():
+        existing = REF_VOICE_TXT.read_text().strip()
+        print(f"Current: \"{existing}\"")
+    ref_text = input("Reference text: ").strip()
+    if not ref_text:
+        print("❌ Reference text is required. Run setup-voice again.")
+        return
+
+    REF_VOICE_TXT.write_text(ref_text + "\n")
+    print(f"✅ Reference text saved to {REF_VOICE_TXT}")
+
+    print()
+    print("🎉 Voice setup complete!")
+    print(f"   Audio: {REF_VOICE_WAV}")
+    print(f"   Text:  {REF_VOICE_TXT}")
+    print()
+    print("To use NeuTTS, run:")
+    print("   python shadow.py set-provider neutts")
+    print("   python shadow.py restart")
+
+
 # ── CLI ───────────────────────────────────────────────────────────
 
 def main():
@@ -683,7 +1000,7 @@ def main():
     # Direct run (foreground)
     parser.add_argument("--voice", default="am_michael", choices=VOICE_LIST)
     parser.add_argument("--speed", type=float, default=1.0)
-    parser.add_argument("--provider", default="cpu", choices=["coreml", "cpu", "auto"])
+    parser.add_argument("--provider", default="kokoro", choices=["kokoro", "neutts"])
     parser.add_argument("--db", default=None)
 
     # Server commands
@@ -701,8 +1018,13 @@ def main():
     set_voice = sub.add_parser("set-voice", help="Change voice (hot-reloads if server running)")
     set_voice.add_argument("voice", choices=VOICE_LIST)
 
-    set_speed = sub.add_parser("set-speed", help="Change speech speed")
+    set_speed = sub.add_parser("set-speed", help="Change speech speed (Kokoro only)")
     set_speed.add_argument("speed", type=float)
+
+    set_provider = sub.add_parser("set-provider", help="Change TTS engine (requires restart)")
+    set_provider.add_argument("provider", choices=["kokoro", "neutts"])
+
+    sub.add_parser("setup-voice", help="Record reference audio for NeuTTS voice cloning")
 
     # Internal
     sub.add_parser("_run_server", help=argparse.SUPPRESS)
@@ -758,6 +1080,27 @@ def main():
         state["speed"] = args.speed
         save_state(state)
         print(f"✅ Speed set to {args.speed}x")
+        if state.get("provider") == "neutts":
+            print("   ⚠ Speed control is not available with NeuTTS provider.")
+        return
+
+    if args.command == "set-provider":
+        state = load_state()
+        old_provider = state.get("provider", "kokoro")
+        state["provider"] = args.provider
+        save_state(state)
+        print(f"✅ Provider set to {args.provider}")
+        if args.provider == "neutts" and not REF_VOICE_WAV.exists():
+            print(f"   ⚠ No reference audio found. Run: python shadow.py setup-voice")
+        if is_server_running():
+            if old_provider != args.provider:
+                print("   ⚠ Provider change requires restart. Run: python shadow.py restart")
+            else:
+                print("   Server will hot-reload on next poll cycle.")
+        return
+
+    if args.command == "setup-voice":
+        _setup_voice()
         return
 
     if args.command == "progress":
@@ -804,6 +1147,8 @@ def main():
         speed=args.speed,
         provider=args.provider,
         db_path=db_path,
+        ref_audio=REF_VOICE_WAV if args.provider == "neutts" else None,
+        ref_text=None,
     )
 
     def handle_sigint(sig, frame):

@@ -6,6 +6,7 @@ const SHADOW_DIR = path.join(process.env.HOME || "~", "shadow-companion");
 const VENV_PYTHON = path.join(SHADOW_DIR, ".venv", "bin", "python3");
 const SHADOW_SCRIPT = path.join(SHADOW_DIR, "shadow.py");
 const STATE_FILE = path.join(process.env.HOME || "~", ".shadow-companion", "state.json");
+const DAILY_PROGRESS_FILE = path.join(process.env.HOME || "~", ".shadow-companion", "daily-progress.json");
 
 function python(): string {
   try {
@@ -33,12 +34,29 @@ export interface CompanionState {
   running: boolean;
 }
 
+export interface DailyProgress {
+  date: string;
+  actual_seconds: number;
+  stt_seconds: number;
+  target_seconds: number;
+  progress: number;
+}
+
 export function getState(): CompanionState {
   try {
     const raw = readFileSync(STATE_FILE, "utf-8");
     return JSON.parse(raw);
   } catch {
-    return { voice: "am_michael", speed: 1.0, provider: "cpu", running: false };
+    return { voice: "am_michael", speed: 1.0, provider: "kokoro", running: false };
+  }
+}
+
+export function getProgress(): DailyProgress | null {
+  try {
+    const raw = readFileSync(DAILY_PROGRESS_FILE, "utf-8");
+    return JSON.parse(raw);
+  } catch {
+    return null;
   }
 }
 

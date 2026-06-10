@@ -1,5 +1,5 @@
 // Shadow Meter — Perry menubar app
-// Shows daily Handy STT recording progress as a menubar icon
+// Shows daily TTS playback progress (shadowing time) as a menubar icon
 
 import { readFileSync, existsSync } from "fs"
 import { join } from "path"
@@ -80,7 +80,7 @@ function getIconPath(progress: Progress): string {
 function getTooltip(progress: Progress): string {
     const actualMin = Math.floor(progress.actual_seconds / 60)
     const targetMin = Math.floor(progress.target_seconds / 60)
-    return `${actualMin}/${targetMin} min — Shadow Meter`
+    return `${actualMin}/${targetMin} min shadowing — Shadow Meter`
 }
 
 // ── update ────────────────────────────────────────────────────────

@@ -1,6 +1,6 @@
 import { List, ActionPanel, Action, Icon, Color, showToast, Toast } from "@raycast/api";
 import { useState, useEffect } from "react";
-import { isRunning, runShadowCommand, getState } from "./lib";
+import { isRunning, runShadowCommand, getState, getProgress } from "./lib";
 
 const VOICE_MAP: Record<string, string> = {
   am_michael: "Michael",
@@ -23,10 +23,19 @@ const VOICE_MAP: Record<string, string> = {
   af_kore: "Kore",
 };
 
+function formatDuration(seconds: number): string {
+  if (seconds < 60) return `${seconds.toFixed(0)}s`;
+  const min = Math.floor(seconds / 60);
+  const sec = Math.round(seconds % 60);
+  return sec > 0 ? `${min}m ${sec}s` : `${min}m`;
+}
+
 export default function Command() {
   const [running, setRunning] = useState(false);
   const [voice, setVoice] = useState("");
   const [speed, setSpeed] = useState(1.0);
+  const [provider, setProvider] = useState("kokoro");
+  const [progress, setProgress] = useState<{ actual: number; target: number; pct: number } | null>(null);
 
   useEffect(() => {
     const check = () => {
@@ -35,6 +44,16 @@ export default function Command() {
         const state = getState();
         setVoice(state.voice);
         setSpeed(state.speed);
+        setProvider(state.provider);
+
+        const p = getProgress();
+        if (p) {
+          setProgress({
+            actual: p.actual_seconds,
+            target: p.target_seconds,
+            pct: Math.round(p.progress * 100),
+          });
+        }
       } catch {
         setRunning(false);
       }
@@ -50,7 +69,7 @@ export default function Command() {
       runShadowCommand("serve");
       toast.style = Toast.Style.Success;
       toast.title = "🦭 Shadow Companion started";
-      toast.message = "kqueue watching · streaming playback";
+      toast.message = `${provider === "neutts" ? "NeuTTS voice cloning" : "Kokoro streaming"} playback`;
       setRunning(true);
     } catch (e) {
       toast.style = Toast.Style.Failure;
@@ -88,6 +107,8 @@ export default function Command() {
   };
 
   const voiceLabel = VOICE_MAP[voice] || voice;
+  const providerLabel = provider === "neutts" ? "NeuTTS (voice cloning)" : "Kokoro (built-in voices)";
+  const providerIcon = provider === "neutts" ? Icon.Person : Icon.Microphone;
 
   return (
     <List>
@@ -99,13 +120,40 @@ export default function Command() {
           icon={{ source: running ? Icon.Circle : Icon.XMarkCircle, tintColor: running ? Color.Green : Color.Red }}
         />
         <List.Item
-          id="voice"
-          title="Voice"
-          accessories={[{ text: voiceLabel || "am_michael" }]}
-          icon={Icon.Microphone}
+          id="provider"
+          title="Provider"
+          accessories={[{ text: providerLabel }]}
+          icon={providerIcon}
         />
-        <List.Item id="speed" title="Speed" accessories={[{ text: `${speed}x` }]} icon={Icon.Gauge} />
+        {provider === "kokoro" && (
+          <List.Item
+            id="voice"
+            title="Voice"
+            accessories={[{ text: voiceLabel || "am_michael" }]}
+            icon={Icon.Microphone}
+          />
+        )}
+        {provider === "kokoro" && (
+          <List.Item id="speed" title="Speed" accessories={[{ text: `${speed}x` }]} icon={Icon.Gauge} />
+        )}
       </List.Section>
+
+      {progress && (
+        <List.Section title="Daily Progress">
+          <List.Item
+            id="progress"
+            title="Shadowing Time"
+            accessories={[{ text: `${formatDuration(progress.actual)} / ${formatDuration(progress.target)}` }]}
+            icon={Icon.Clock}
+          />
+          <List.Item
+            id="progress-pct"
+            title="Completion"
+            accessories={[{ text: `${progress.pct}%` }]}
+            icon={progress.pct >= 100 ? { source: Icon.Checkmark, tintColor: Color.Green } : Icon.Chart}
+          />
+        </List.Section>
+      )}
 
       <List.Section title="Actions">
         {!running ? (

@@ -3,17 +3,17 @@ import { useState, useEffect } from "react";
 import { VOICES, runShadowCommand, isRunning, getState } from "./lib";
 
 export default function Command() {
-  const [currentVoice, setCurrentVoice] = useState("am_michael");
-  const [serverRunning, setServerRunning] = useState(false);
+  const [selectedVoice, setSelectedVoice] = useState<string | null>(null);
+  const [provider, setProvider] = useState("kokoro");
 
   useEffect(() => {
     try {
       const state = getState();
-      setCurrentVoice(state.voice);
+      setSelectedVoice(state.voice);
+      setProvider(state.provider);
     } catch {
-      // defaults
+      // ignore
     }
-    setServerRunning(isRunning());
   }, []);
 
   const handleSelect = async (voiceId: string) => {
@@ -21,12 +21,10 @@ export default function Command() {
     const toast = await showToast({ style: Toast.Style.Animated, title: `Switching to ${voice?.label || voiceId}...` });
     try {
       runShadowCommand("set-voice", voiceId);
-      setCurrentVoice(voiceId);
       toast.style = Toast.Style.Success;
-      toast.title = `🦭 Voice → ${voice?.label || voiceId}`;
-      if (serverRunning) {
-        toast.message = "Hot-reloads instantly via kqueue";
-      }
+      toast.title = `Voice set to ${voice?.label || voiceId}`;
+      toast.message = "Will take effect on next utterance";
+      setSelectedVoice(voiceId);
     } catch (e) {
       toast.style = Toast.Style.Failure;
       toast.title = "Failed to switch voice";
@@ -34,46 +32,73 @@ export default function Command() {
     }
   };
 
+  // NeuTTS uses your own cloned voice — no voice switching
+  if (provider === "neutts") {
+    return (
+      <List>
+        <List.Section title="NeuTTS Voice Cloning">
+          <List.Item
+            id="neutts-info"
+            title="Using your cloned voice"
+            subtitle="NeuTTS clones your voice from reference audio"
+            icon={Icon.Person}
+          />
+          <List.Item
+            id="neutts-setup"
+            title="Re-record reference audio"
+            subtitle="Run: python shadow.py setup-voice"
+            icon={Icon.Microphone}
+            actions={
+              <ActionPanel>
+                <Action
+                  title="Setup Voice"
+                  onAction={() => {
+                    runShadowCommand("setup-voice");
+                  }}
+                />
+              </ActionPanel>
+            }
+          />
+        </List.Section>
+      </List>
+    );
+  }
+
+  // Kokoro: show full voice list
   const maleVoices = VOICES.filter((v) => v.id.startsWith("am_"));
   const femaleVoices = VOICES.filter((v) => v.id.startsWith("af_"));
 
   return (
     <List>
       <List.Section title="Male Voices">
-        {maleVoices.map((v) => (
+        {maleVoices.map((voice) => (
           <List.Item
-            key={v.id}
-            id={v.id}
-            title={v.label}
-            subtitle={v.desc}
-            icon={{
-              source: v.id === currentVoice ? Icon.Checkmark : Icon.Circle,
-              tintColor: v.id === currentVoice ? Color.Green : Color.SecondaryText,
-            }}
-            accessories={v.id === currentVoice ? [{ text: "Active" }] : []}
+            key={voice.id}
+            id={voice.id}
+            title={voice.label}
+            subtitle={voice.desc}
+            icon={selectedVoice === voice.id ? { source: Icon.Checkmark, tintColor: Color.Green } : Icon.Microphone}
+            accessories={selectedVoice === voice.id ? [{ text: "Active" }] : []}
             actions={
               <ActionPanel>
-                <Action title="Select Voice" onAction={() => handleSelect(v.id)} />
+                <Action title="Select Voice" onAction={() => handleSelect(voice.id)} />
               </ActionPanel>
             }
           />
         ))}
       </List.Section>
       <List.Section title="Female Voices">
-        {femaleVoices.map((v) => (
+        {femaleVoices.map((voice) => (
           <List.Item
-            key={v.id}
-            id={v.id}
-            title={v.label}
-            subtitle={v.desc}
-            icon={{
-              source: v.id === currentVoice ? Icon.Checkmark : Icon.Circle,
-              tintColor: v.id === currentVoice ? Color.Green : Color.SecondaryText,
-            }}
-            accessories={v.id === currentVoice ? [{ text: "Active" }] : []}
+            key={voice.id}
+            id={voice.id}
+            title={voice.label}
+            subtitle={voice.desc}
+            icon={selectedVoice === voice.id ? { source: Icon.Checkmark, tintColor: Color.Green } : Icon.Microphone}
+            accessories={selectedVoice === voice.id ? [{ text: "Active" }] : []}
             actions={
               <ActionPanel>
-                <Action title="Select Voice" onAction={() => handleSelect(v.id)} />
+                <Action title="Select Voice" onAction={() => handleSelect(voice.id)} />
               </ActionPanel>
             }
           />

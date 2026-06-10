@@ -17,6 +17,8 @@ declare namespace Preferences {
   export type Control = ExtensionPreferences & {}
   /** Preferences accessible in the `switch-voice` command */
   export type SwitchVoice = ExtensionPreferences & {}
+  /** Preferences accessible in the `switch-provider` command */
+  export type SwitchProvider = ExtensionPreferences & {}
   /** Preferences accessible in the `adjust-speed` command */
   export type AdjustSpeed = ExtensionPreferences & {}
 }
@@ -26,6 +28,8 @@ declare namespace Arguments {
   export type Control = {}
   /** Arguments passed to the `switch-voice` command */
   export type SwitchVoice = {}
+  /** Arguments passed to the `switch-provider` command */
+  export type SwitchProvider = {}
   /** Arguments passed to the `adjust-speed` command */
   export type AdjustSpeed = {}
 }
