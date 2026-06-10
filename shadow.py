@@ -39,6 +39,10 @@ POLL_S = 0.1  # Fallback poll interval (kqueue used when available)
 STATE_DIR = Path.home() / ".shadow-companion"
 STATE_FILE = STATE_DIR / "state.json"
 PID_FILE = STATE_DIR / "server.pid"
+DAILY_PROGRESS_FILE = STATE_DIR / "daily-progress.json"
+
+# Default daily target in seconds (60 minutes)
+DEFAULT_DAILY_TARGET_S = 3600
 
 
 # ── state management ──────────────────────────────────────────────
@@ -49,12 +53,184 @@ def load_state() -> dict:
             return json.loads(STATE_FILE.read_text())
         except Exception:
             pass
-    return {"voice": "am_michael", "speed": 1.0, "provider": "cpu", "running": False}
+    return {"voice": "am_michael", "speed": 1.0, "provider": "cpu", "running": False, "daily_target_s": DEFAULT_DAILY_TARGET_S}
 
 
 def save_state(state: dict):
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     STATE_FILE.write_text(json.dumps(state, indent=2))
+
+
+# ── daily progress ────────────────────────────────────────────────
+
+def get_handy_recordings_dir() -> Path | None:
+    """Find Handy's recordings directory on macOS."""
+    base = Path.home() / "Library" / "Application Support" / "com.pais.handy"
+    rec = base / "recordings"
+    if rec.exists():
+        return rec
+    return None
+
+
+def wav_duration(path: Path) -> float:
+    """Read duration from WAV header using stdlib wave (no audio decoding)."""
+    import wave
+    try:
+        with wave.open(str(path), "rb") as wf:
+            frames = wf.getnframes()
+            rate = wf.getframerate()
+            return frames / rate if rate > 0 else 0.0
+    except Exception:
+        return 0.0
+
+
+def compute_daily_stt_duration(db_path: Path) -> float:
+    """Compute total STT recording duration for today (local timezone) in seconds."""
+    import wave as _wave
+    from datetime import date, datetime, timezone
+
+    today = date.today()
+    # Naive datetime = local midnight. .timestamp() converts to UTC epoch correctly.
+    today_start = datetime(today.year, today.month, today.day)
+    today_start_ts = int(today_start.timestamp())
+    # End of today (exclusive)
+    from datetime import timedelta
+    tomorrow = today + timedelta(days=1)
+    tomorrow_start = datetime(tomorrow.year, tomorrow.month, tomorrow.day)
+    tomorrow_start_ts = int(tomorrow_start.timestamp())
+
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        cursor = conn.execute(
+            """
+            SELECT file_name, timestamp
+            FROM transcription_history
+            WHERE transcription_text != ''
+              AND timestamp >= ? AND timestamp < ?
+            """,
+            (today_start_ts, tomorrow_start_ts),
+        )
+        rows = cursor.fetchall()
+        conn.close()
+    except Exception:
+        return 0.0
+
+    rec_dir = get_handy_recordings_dir()
+    if rec_dir is None:
+        return 0.0
+
+    total_seconds = 0.0
+    for file_name, _ts in rows:
+        wav_path = rec_dir / file_name
+        if wav_path.exists():
+            total_seconds += wav_duration(wav_path)
+
+    return total_seconds
+
+
+def write_daily_progress(db_path: Path | None = None):
+    """Write ~/.shadow-companion/daily-progress.json for Perry menubar app."""
+    from datetime import date
+
+    if db_path is None:
+        db_path = find_handy_db()
+    if db_path is None:
+        return
+
+    actual_seconds = compute_daily_stt_duration(db_path)
+    state = load_state()
+    target_seconds = state.get("daily_target_s", DEFAULT_DAILY_TARGET_S)
+    progress = min(1.0, actual_seconds / target_seconds) if target_seconds > 0 else 0.0
+
+    progress_data = {
+        "date": date.today().isoformat(),
+        "actual_seconds": round(actual_seconds, 1),
+        "target_seconds": target_seconds,
+        "progress": round(progress, 4),
+    }
+
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    DAILY_PROGRESS_FILE.write_text(json.dumps(progress_data, indent=2))
+
+
+def _verify_progress():
+    """Print detailed breakdown of daily progress calculation for verification."""
+    from datetime import date, datetime, timedelta
+
+    db_path = find_handy_db()
+    if db_path is None:
+        print("❌ Could not find Handy's history.db")
+        sys.exit(1)
+
+    today = date.today()
+    today_start = datetime(today.year, today.month, today.day)
+    today_start_ts = int(today_start.timestamp())
+    tomorrow = today + timedelta(days=1)
+    tomorrow_start = datetime(tomorrow.year, tomorrow.month, tomorrow.day)
+    tomorrow_start_ts = int(tomorrow_start.timestamp())
+
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(
+        """
+        SELECT id, file_name, timestamp, transcription_text
+        FROM transcription_history
+        WHERE transcription_text != ''
+          AND timestamp >= ? AND timestamp < ?
+        ORDER BY timestamp ASC
+        """,
+        (today_start_ts, tomorrow_start_ts),
+    ).fetchall()
+    conn.close()
+
+    rec_dir = get_handy_recordings_dir()
+    state = load_state()
+    target_s = state.get("daily_target_s", DEFAULT_DAILY_TARGET_S)
+
+    total = 0.0
+    missing = 0
+
+    print(f"Date:          {today.isoformat()}")
+    print(f"DB:            {db_path}")
+    print(f"Recordings:    {rec_dir}")
+    print(f"Time range:    {today_start_ts} — {tomorrow_start_ts}")
+    print(f"Target:        {target_s}s ({target_s // 60} min)")
+    print(f"Entries today: {len(rows)}")
+    print()
+
+    for r in rows:
+        wav = rec_dir / r["file_name"] if rec_dir else None
+        dur = wav_duration(wav) if wav and wav.exists() else 0.0
+        total += dur
+        text_preview = r["transcription_text"][:60].replace("\n", " ")
+        if wav and wav.exists():
+            exists = "✓"
+        else:
+            exists = "✗ MISSING"
+            missing += 1
+        print(f"  {r['file_name']}  {dur:>6.1f}s  {exists}  \"{text_preview}...\"")
+
+    progress = min(1.0, total / target_s) if target_s > 0 else 0.0
+    print()
+    print(f"Total:   {total:.1f}s ({total / 60:.1f} min)")
+    print(f"Target:  {target_s}s ({target_s // 60} min)")
+    print(f"Progress: {progress:.4f} ({progress * 100:.1f}%)")
+    if missing:
+        print(f"⚠  {missing} WAV file(s) missing — durations not counted")
+
+    # Cross-check with daily-progress.json
+    if DAILY_PROGRESS_FILE.exists():
+        data = json.loads(DAILY_PROGRESS_FILE.read_text())
+        print()
+        print(f"daily-progress.json:")
+        print(f"  date:            {data.get('date')}")
+        print(f"  actual_seconds:  {data.get('actual_seconds')}")
+        print(f"  target_seconds:  {data.get('target_seconds')}")
+        print(f"  progress:        {data.get('progress')}")
+        if abs(data.get('actual_seconds', 0) - total) > 0.5:
+            print(f"  ⚠ JSON stale — recompute with: python shadow.py progress")
+    else:
+        print("\n⚠ No daily-progress.json found — run: python shadow.py progress")
 
 
 # ── Handy DB ──────────────────────────────────────────────────────
@@ -273,6 +449,10 @@ class ShadowCompanion:
                     self.speak_streaming(text.strip())
                 self.last_id = entry["id"]
 
+            # Update daily progress after processing new entries
+            if entries:
+                write_daily_progress(self.db_path)
+
             # Wait for DB change via kqueue
             try:
                 kq = select.kqueue()
@@ -307,6 +487,10 @@ class ShadowCompanion:
                 if text.strip():
                     self.speak_streaming(text.strip())
                 self.last_id = entry["id"]
+
+            # Update daily progress after processing new entries
+            if entries:
+                write_daily_progress(self.db_path)
 
             time.sleep(POLL_S)
 
@@ -471,6 +655,9 @@ def _run_server():
         db_path=db_path,
     )
 
+    # Write initial daily progress
+    write_daily_progress(db_path)
+
     def handle_sigterm(sig, frame):
         companion.stop()
         PID_FILE.unlink(missing_ok=True)
@@ -504,6 +691,12 @@ def main():
     sub.add_parser("stop", help="Stop running server")
     sub.add_parser("status", help="Check server status")
     sub.add_parser("restart", help="Restart server")
+
+    sub.add_parser("progress", help="Compute and print daily STT progress")
+    sub.add_parser("verify", help="Show detailed breakdown of daily progress calculation")
+
+    set_daily_target = sub.add_parser("set-daily-target", help="Set daily target in minutes")
+    set_daily_target.add_argument("minutes", type=int)
 
     set_voice = sub.add_parser("set-voice", help="Change voice (hot-reloads if server running)")
     set_voice.add_argument("voice", choices=VOICE_LIST)
@@ -565,6 +758,37 @@ def main():
         state["speed"] = args.speed
         save_state(state)
         print(f"✅ Speed set to {args.speed}x")
+        return
+
+    if args.command == "progress":
+        db_path = find_handy_db()
+        if db_path is None:
+            print("❌ Could not find Handy's history.db")
+            sys.exit(1)
+        write_daily_progress(db_path)
+        if DAILY_PROGRESS_FILE.exists():
+            data = json.loads(DAILY_PROGRESS_FILE.read_text())
+            actual_min = data["actual_seconds"] / 60
+            target_min = data["target_seconds"] / 60
+            pct = data["progress"] * 100
+            print(f"📊 {actual_min:.1f}/{target_min:.0f} min ({pct:.0f}%) — {data['date']}")
+        else:
+            print("❌ Could not compute progress")
+        return
+
+    if args.command == "verify":
+        _verify_progress()
+        return
+
+    if args.command == "set-daily-target":
+        state = load_state()
+        state["daily_target_s"] = args.minutes * 60
+        save_state(state)
+        print(f"✅ Daily target set to {args.minutes} minutes")
+        # Recompute progress with new target
+        db_path = find_handy_db()
+        if db_path:
+            write_daily_progress(db_path)
         return
 
     # Default: direct foreground run

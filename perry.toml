@@ -1,0 +1,12 @@
+[project]
+name = "shadow-meter"
+version = "1.0.0"
+entry = "src/main.ts"
+
+[build]
+out_dir = "dist"
+
+[macos]
+bundle_id = "com.shadow-companion.meter"
+category = "public.app-category.utilities"
+minimum_os = "13.0"

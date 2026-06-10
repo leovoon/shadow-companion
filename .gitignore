@@ -8,6 +8,12 @@ venv/
 # Shadow companion state
 .shadow-companion/
 
+# Perry build output
+dist/
+
+# Generated icons (user-local)
+perry-icons/
+
 # Raycast
 raycast-extension/node_modules/
 raycast-extension/dist/
@@ -15,3 +21,5 @@ raycast-extension/.DS_Store
 
 # OS
 .DS_Store
+.perry-cache/
+src/test_tray.ts
