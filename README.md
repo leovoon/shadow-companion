@@ -13,6 +13,34 @@ Supports two TTS providers:
 - **Kokoro** — Built-in voices, adjustable speed, fast startup
 - **NeuTTS Air** — Voice cloning from your own reference audio, streaming playback
 
+## Prerequisites
+
+- **macOS** 13+ (kqueue for DB watching, Perry for menubar)
+- **Python 3.10+**
+- **[Handy](https://github.com/cjpais/Handy)** — STT app that provides the transcription database
+- **[Node.js](https://nodejs.org/)** — for the Raycast extension (optional)
+
+### Python packages
+
+| Package | Required by | Purpose |
+|---------|------------|---------|
+| `pykokoro` | Kokoro | TTS engine + ONNX inference |
+| `sounddevice` | Both | Audio playback |
+| `numpy` | Both | Audio array handling |
+| `pyperclip` | Kokoro | Clipboard access |
+| `Pillow` | Menubar | Icon generation |
+| `spacy` (+ `en_core_web_sm`) | Kokoro | Text segmentation |
+| `neutts` | NeuTTS | Voice cloning TTS engine |
+| `llama-cpp-python` | NeuTTS | GGUF model inference |
+| `onnxruntime` | NeuTTS | Codec decoder |
+
+### External tools (optional)
+
+| Tool | Purpose |
+|------|---------|
+| [Perry](https://github.com/PerryTS/perry) | macOS menubar progress tracker |
+| [Raycast](https://raycast.com/) | Keyboard-driven control extension |
+
 ## Setup
 
 ```bash
@@ -20,14 +48,14 @@ cd ~/shadow-companion
 python3 -m venv .venv
 source .venv/bin/activate
 
-# Install dependencies (Kokoro only)
+# Core dependencies (required for Kokoro)
 pip install pykokoro pyperclip sounddevice numpy Pillow
 
-# For NeuTTS support, also install:
-pip install neutts llama-cpp-python onnxruntime
-
-# Download English language model (Kokoro)
+# Download English language model
 python -m spacy download en_core_web_sm
+
+# For NeuTTS voice cloning (optional)
+pip install neutts llama-cpp-python onnxruntime
 ```
 
 ## Usage
