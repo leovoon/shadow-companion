@@ -27,6 +27,7 @@ import signal
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -39,6 +40,7 @@ VOICE_LIST = [
 ]
 
 POLL_S = 0.1  # Fallback poll interval (kqueue used when available)
+IDLE_TIMEOUT_S = 600  # Kill TTS worker after this many seconds idle (10 min)
 
 
 # Server state file
@@ -64,7 +66,7 @@ def load_state() -> dict:
             return json.loads(STATE_FILE.read_text())
         except Exception:
             pass
-    return {"voice": "am_michael", "speed": 1.0, "provider": "cpu", "running": False, "daily_target_s": DEFAULT_DAILY_TARGET_S}
+    return {"voice": "am_michael", "speed": 1.0, "provider": "kokoro", "running": False, "daily_target_s": DEFAULT_DAILY_TARGET_S}
 
 
 def save_state(state: dict):
@@ -339,26 +341,23 @@ def get_new_entries(db_path: Path, since_id: int) -> list[dict]:
 # ── TTS ───────────────────────────────────────────────────────────
 
 class ShadowCompanion:
-    def __init__(self, voice: str, speed: float, provider: str, db_path: Path,
-                 ref_audio: Path | None = None, ref_text: str | None = None):
-        import numpy as np
-        import sounddevice as sd
-
-        self._np = np
-        self._sd = sd
+    def __init__(self, voice: str, speed: float, provider: str, db_path: Path):
         self.voice = voice
         self.speed = speed
         self.provider = provider
         self.db_path = db_path
         self.last_id = get_latest_entry_id(db_path)
         self.running = True
+        self._state_mtime: float = 0.0
 
-        # Provider-specific initialization
-        if provider == "kokoro":
-            self._init_kokoro(voice, speed, provider)
-        elif provider == "neutts":
-            self._init_neutts(ref_audio, ref_text)
-        else:
+        # TTS worker subprocess — models load in child process for full memory reclamation
+        self._model_lock = threading.Lock()
+        self._worker_proc = None  # subprocess.Popen or None
+        self._last_speak_time = 0.0
+        self._worker_ready = threading.Event()  # set when worker prints WORKER_READY
+
+        # Validate provider
+        if provider not in ("kokoro", "neutts"):
             print(f"❌ Unknown provider: {provider}. Use 'kokoro' or 'neutts'.")
             sys.exit(1)
 
@@ -371,92 +370,131 @@ class ShadowCompanion:
         save_state(state)
 
         print(f"Watching: {db_path}")
-        print(f"Ready. Speak into Handy — your words will be spoken back.")
+        print(f"Ready. TTS worker loads on first utterance. Ctrl+C to quit.")
         if provider == "kokoro":
-            print(f"Voice: {voice} | Speed: {speed}x | Provider: {provider} | Ctrl+C to quit\n")
+            print(f"Voice: {voice} | Speed: {speed}x | Provider: {provider}\n")
         else:
-            print(f"Provider: {provider} (cloning your voice) | Ctrl+C to quit\n")
+            print(f"Provider: {provider} (cloning your voice)\n")
 
-    def _init_kokoro(self, voice: str, speed: float, provider: str):
-        from pykokoro import build_pipeline, PipelineConfig
-        from pykokoro.generation_config import GenerationConfig
-        from pykokoro.stages.doc_parsers.ssmd import SsmdDocumentParser
-        from pykokoro.stages.g2p.kokorog2p import KokoroG2PAdapter
-        from pykokoro.stages.phoneme_processing.onnx import OnnxPhonemeProcessorAdapter
-        from pykokoro.stages.audio_generation.onnx import OnnxAudioGenerationAdapter
-        from pykokoro.stages.audio_postprocessing.onnx import OnnxAudioPostprocessingAdapter
-        from pykokoro.runtime.tracing import Trace
-        from pykokoro.constants import SAMPLE_RATE
-        from pykokoro.types import Segment
-        from dataclasses import replace as dc_replace
 
-        self._build_pipeline = build_pipeline
-        self._PipelineConfig = PipelineConfig
-        self._dc_replace = dc_replace
-        self._SsmdDocumentParser = SsmdDocumentParser
-        self._KokoroG2PAdapter = KokoroG2PAdapter
-        self._OnnxPhonemeProcessorAdapter = OnnxPhonemeProcessorAdapter
-        self._OnnxAudioGenerationAdapter = OnnxAudioGenerationAdapter
-        self._OnnxAudioPostprocessingAdapter = OnnxAudioPostprocessingAdapter
-        self._Trace = Trace
-        self._SAMPLE_RATE = SAMPLE_RATE
-        self._Segment = Segment
 
-        print(f"Loading Kokoro model (voice={voice}, provider={provider})...")
-        self.pipe = build_pipeline(
-            config={"voice": voice, "provider": provider, "generation": {"speed": speed}},
-            eager=True,
+    def _ensure_worker(self):
+        """Ensure TTS worker subprocess is running."""
+        if self._worker_proc is not None and self._worker_proc.poll() is None:
+            return
+        with self._model_lock:
+            if self._worker_proc is not None and self._worker_proc.poll() is None:
+                return
+            self._start_worker()
+
+    def _start_worker(self):
+        """Start the TTS worker subprocess."""
+        # For NeuTTS: ensure reference codes are pre-encoded (torch is only needed
+        # for encoding, not inference — encoder runs in a separate subprocess)
+        if self.provider == "neutts" and not REF_CODES_FILE.exists():
+            print("  🔧 Encoding reference audio (one-time, torch loaded briefly)...")
+            venv_python = Path(__file__).parent / ".venv" / "bin" / "python3"
+            python = str(venv_python) if venv_python.exists() else sys.executable
+            script = Path(__file__).resolve().as_posix()
+            enc = subprocess.run(
+                [python, "-u", script, "_encode_ref"],
+                capture_output=True, text=True, timeout=120,
+            )
+            if enc.stdout:
+                for line in enc.stdout.strip().split("\n"):
+                    print(f"    [encoder] {line}")
+            if enc.returncode != 0:
+                print(f"  ❌ Reference encoding failed: {enc.stderr}")
+                return
+            print("  ✅ Reference codes saved")
+
+        venv_python = Path(__file__).parent / ".venv" / "bin" / "python3"
+        python = str(venv_python) if venv_python.exists() else sys.executable
+        script = Path(__file__).resolve().as_posix()
+
+        self._worker_ready.clear()
+        self._worker_proc = subprocess.Popen(
+            [python, "-u", script, "_tts_worker"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            bufsize=1,  # line-buffered
+            start_new_session=False,  # same process group so SIGTERM kills both
         )
+        # Drain worker stdout (loading messages) in background
+        threading.Thread(target=self._drain_worker_stdout, daemon=True).start()
+        # Wait for worker to finish loading models (up to 120s)
+        print("  🔧 TTS worker loading models...")
+        if self._worker_ready.wait(timeout=120):
+            self._last_speak_time = time.monotonic()
+            print("  ✅ TTS worker ready\n")
+        else:
+            print("  ⚠ TTS worker did not become ready in 120s, will try on next utterance\n")
+            self._kill_worker()
 
-        # Pre-warm: generate a short phrase so ONNX session is fully initialized
-        print("Pre-warming TTS engine...")
-        self.pipe.run("Ready.")
+    def _drain_worker_stdout(self):
+        """Background thread: print worker stdout (loading messages, errors)."""
+        proc = self._worker_proc
+        if proc is None or proc.stdout is None:
+            return
+        try:
+            for line in proc.stdout:
+                line_str = line.decode("utf-8", errors="replace").rstrip()
+                if not line_str:
+                    continue
+                if line_str == "WORKER_READY":
+                    self._worker_ready.set()
+                else:
+                    print(f"  [worker] {line_str}")
+        except (ValueError, OSError):
+            pass  # pipe closed
+        finally:
+            # If pipe closed before WORKER_READY, unblock the wait
+            self._worker_ready.set()
 
-    def _init_neutts(self, ref_audio: Path | None, ref_text: str | None):
-        from neutts import NeuTTS
-        import soundfile as sf
+    def _kill_worker(self):
+        """Kill TTS worker subprocess — OS reclaims ALL memory instantly."""
+        with self._model_lock:
+            if self._worker_proc is None:
+                return
+            proc = self._worker_proc
+            self._worker_proc = None
+            self._worker_ready.clear()
+            try:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(timeout=2)
+            except (ProcessLookupError, OSError):
+                pass
+            print("  💤 TTS worker killed (idle timeout) — memory freed\n")
 
-        # Resolve reference audio/text
-        ref_audio = ref_audio or REF_VOICE_WAV
-        ref_text_path = REF_VOICE_TXT if ref_text is None else None
-
-        if not ref_audio.exists():
-            print(f"❌ No reference audio found at {ref_audio}")
-            print(f"   Run: python shadow.py setup-voice")
-            print(f"   Or place a 3-15 second .wav file at {REF_VOICE_WAV}")
-            print(f"   with a matching transcript at {REF_VOICE_TXT}")
-            sys.exit(1)
-
-        # Load reference text
-        if ref_text is None:
-            if ref_text_path and ref_text_path.exists():
-                ref_text = ref_text_path.read_text().strip()
-            else:
-                print(f"❌ No reference text found at {ref_text_path}")
-                print(f"   Create {REF_VOICE_TXT} with the transcript of your reference audio.")
-                sys.exit(1)
-
-        print(f"Loading NeuTTS Air Q8 model...")
-        self._neutts = NeuTTS(
-            backbone_repo="neuphonic/neutts-air-q8-gguf",
-            backbone_device="cpu",
-            codec_repo="neuphonic/neucodec",
-            codec_device="cpu",
-        )
-        self._sf = sf
-        self._ref_audio_path = str(ref_audio)
-        self._ref_text = ref_text
-
-        print("Encoding reference audio...")
-        self._ref_codes = self._neutts.encode_reference(self._ref_audio_path)
-
-        # Pre-warm
-        print("Pre-warming TTS engine...")
-        wav = self._neutts.infer("Ready.", self._ref_codes, self._ref_text)
-        print(f"NeuTTS ready (ref: {ref_audio.name}, {len(ref_text)} chars)")
+    def _idle_unloader(self):
+        """Background thread: kill TTS worker after IDLE_TIMEOUT_S,
+        and periodically refresh daily progress file."""
+        cycle = 0
+        while self.running:
+            time.sleep(60)
+            cycle += 1
+            with self._model_lock:
+                proc = self._worker_proc
+                last = self._last_speak_time
+            if proc is not None and last > 0:
+                idle_seconds = time.monotonic() - last
+                if idle_seconds > IDLE_TIMEOUT_S:
+                    self._kill_worker()
+            # Refresh progress every 5 minutes (the TTS play log may have
+            # been updated by the worker since last DB-triggered refresh)
+            if cycle % 5 == 0:
+                try:
+                    write_daily_progress(self.db_path)
+                except Exception:
+                    pass
 
     def speak_streaming(self, text: str):
-        """Generate and play audio segment-by-segment for lower latency."""
+        """Send text to TTS worker subprocess for playback."""
         text = text.strip()
         if not text:
             return
@@ -465,175 +503,26 @@ class ShadowCompanion:
             print(f"  ⚠ truncated to 500 chars")
         print(f"  ▶ {text[:80]}{'...' if len(text) > 80 else ''}")
 
-        if self.provider == "kokoro":
-            self._speak_kokoro(text)
-        elif self.provider == "neutts":
-            self._speak_neutts(text)
-
-    def _speak_kokoro(self, text: str):
-        """Kokoro streaming: segment-by-segment playback."""
-        for attempt in range(3):
-            try:
-                config = self.pipe.config
-                trace = self._Trace()
-
-                # Stage 1: Parse + Phonemize (fast, ~10ms)
-                doc = self._SsmdDocumentParser().parse(text, config, trace)
-                segments = doc.segments
-                if not segments and doc.clean_text:
-                    segments = [self._Segment(
-                        id="p0_s0_c0_seg0", text=doc.clean_text,
-                        char_start=0, char_end=len(doc.clean_text),
-                        paragraph_idx=0, sentence_idx=0, clause_idx=0,
-                    )]
-                phoneme_segments = self._KokoroG2PAdapter().phonemize(
-                    segments, doc, config, trace
-                )
-
-                # Fast path: single segment → use pipe.run() (avoids adapter overhead)
-                if len(phoneme_segments) <= 1:
-                    res = self.pipe.run(text)
-                    if res.audio is None or len(res.audio) == 0:
-                        print("  ⚠ no audio generated\n")
-                        return
-                    audio = res.audio.astype(self._np.float32) if hasattr(res.audio, 'astype') else self._np.array(res.audio, dtype=self._np.float32)
-                    duration = len(audio) / res.sample_rate
-                    self._sd.play(audio, res.sample_rate)
-                    self._sd.wait()
-                    log_tts_play(duration)
-                    print(f"  ✓ {duration:.1f}s played\n")
-                    return
-
-                # Streaming path: multiple segments → play each as generated
-                kokoro, _ = self.pipe._ensure_kokoro(config)
-                pp = self._OnnxPhonemeProcessorAdapter(kokoro)
-                phoneme_segments = pp.process(phoneme_segments, config, trace)
-
-                ag = self._OnnxAudioGenerationAdapter(kokoro)
-                ap = self._OnnxAudioPostprocessingAdapter(kokoro)
-
-                total_duration = 0.0
-                for seg in phoneme_segments:
-                    seg_result = ag.generate([seg], config, trace)
-                    audio = ap.postprocess(seg_result, config, trace)
-                    if audio is not None and len(audio) > 0:
-                        audio_f32 = audio.astype(self._np.float32)
-                        dur = len(audio_f32) / self._SAMPLE_RATE
-                        total_duration += dur
-                        # Wait for previous segment before playing next
-                        self._sd.wait()
-                        self._sd.play(audio_f32, self._SAMPLE_RATE)
-
-                self._sd.wait()
-                if total_duration > 0:
-                    log_tts_play(total_duration)
-                    print(f"  ✓ {total_duration:.1f}s played\n")
-                else:
-                    print("  ⚠ no audio generated\n")
-                return
-
-            except Exception as e:
-                if attempt < 2 and ('PortAudio' in str(e) or '-9986' in str(e)):
-                    print(f"  ⚠ Audio device error, retrying ({attempt + 1}/3)...")
-                    self._sd.stop()
-                    time.sleep(0.5)
-                    continue
-                print(f"  ✗ TTS error: {e}\n")
-                return
-
-    def _speak_neutts(self, text: str):
-        """NeuTTS streaming: low-latency gapless playback via OutputStream callback.
-
-        Uses the same queue-based pattern as NeuTTS's official PyAudio example,
-        but with sounddevice.OutputStream callbacks instead — chunks flow from
-        infer_stream() → queue → callback → speakers with no gaps between chunks.
-        """
-        import queue as _queue
-        np = self._np
+        self._ensure_worker()
+        with self._model_lock:
+            proc = self._worker_proc
+        if proc is None or proc.poll() is not None or proc.stdin is None:
+            print("  ✗ TTS worker not available\n")
+            return
 
         try:
-            sample_rate = self._neutts.sample_rate  # 24000
-            chunk_queue = _queue.Queue()
+            # Send text line to worker stdin (JSON-encoded for safety)
+            payload = json.dumps({"text": text}) + "\n"
+            proc.stdin.write(payload.encode("utf-8"))
+            proc.stdin.flush()
+        except (BrokenPipeError, OSError):
+            print("  ✗ TTS worker crashed, will restart on next utterance\n")
+            self._kill_worker()
+            return
 
-            # Buffer state consumed only by the audio callback thread
-            buf = np.zeros(0, dtype=np.float32)
-            buf_offset = 0
-            got_sentinel = False
+        self._last_speak_time = time.monotonic()
 
-            def _callback(outdata, frames, time_info, status):
-                """OutputStream callback: fills outdata from queued chunks."""
-                nonlocal buf, buf_offset, got_sentinel
 
-                if got_sentinel:
-                    outdata[:] = 0
-                    raise self._sd.CallbackStop
-
-                written = 0
-                while written < frames:
-                    # Drain current buffer first
-                    avail = len(buf) - buf_offset
-                    if avail > 0:
-                        n = min(avail, frames - written)
-                        outdata[written:written + n, 0] = buf[buf_offset:buf_offset + n]
-                        buf_offset += n
-                        written += n
-                    else:
-                        # Fetch next chunk from queue
-                        try:
-                            chunk = chunk_queue.get(timeout=2.0)
-                        except _queue.Empty:
-                            # Underrun — pad remaining with silence
-                            outdata[written:, 0] = 0.0
-                            return
-
-                        if chunk is None:  # sentinel = inference done
-                            got_sentinel = True
-                            outdata[written:, 0] = 0.0
-                            raise self._sd.CallbackStop
-
-                        buf = chunk
-                        buf_offset = 0
-
-            # Open OutputStream — callback starts consuming immediately
-            stream = self._sd.OutputStream(
-                samplerate=sample_rate,
-                channels=1,
-                dtype='float32',
-                callback=_callback,
-                blocksize=1024,  # ~43ms at 24kHz — low latency, safe from underruns
-            )
-            stream.start()
-
-            # Feed inference chunks into queue (first chunk plays almost immediately)
-            total_samples = 0
-            for chunk in self._neutts.infer_stream(text, self._ref_codes, self._ref_text):
-                if chunk is not None and len(chunk) > 0:
-                    audio = chunk.astype(np.float32)
-                    chunk_queue.put(audio)
-                    total_samples += len(audio)
-
-            # Tail padding (avoids cutting off final chunk) + sentinel
-            chunk_queue.put(np.zeros(int(0.15 * sample_rate), dtype=np.float32))
-            chunk_queue.put(None)  # signals callback to stop
-
-            # Wait for playback to finish
-            total_duration = total_samples / sample_rate
-            timeout = max(total_duration + 5, 10)
-            deadline = time.monotonic() + timeout
-            while stream.active and time.monotonic() < deadline:
-                time.sleep(0.05)
-
-            stream.stop()
-            stream.close()
-
-            if total_duration > 0:
-                log_tts_play(total_duration)
-                print(f"  ✓ {total_duration:.1f}s played\n")
-            else:
-                print("  ⚠ no audio generated\n")
-
-        except Exception as e:
-            print(f"  ✗ TTS error: {e}\n")
 
     def _watch_db_kqueue(self):
         """Watch DB for changes using kqueue (macOS native, zero-polling-delay)."""
@@ -654,8 +543,11 @@ class ShadowCompanion:
                     self.speak_streaming(text.strip())
                 self.last_id = entry["id"]
 
-            # Update daily progress after processing new entries
+            # Update daily progress after processing new entries.
+            # Small delay so the worker has time to play audio and log
+            # the duration to tts-play-log.json before we read it.
             if entries:
+                time.sleep(0.5)
                 write_daily_progress(self.db_path)
 
             # Wait for DB change via kqueue
@@ -693,14 +585,25 @@ class ShadowCompanion:
                     self.speak_streaming(text.strip())
                 self.last_id = entry["id"]
 
-            # Update daily progress after processing new entries
+            # Update daily progress after processing new entries.
+            # Small delay so the worker has time to play audio and log
+            # the duration to tts-play-log.json before we read it.
             if entries:
+                time.sleep(0.5)
                 write_daily_progress(self.db_path)
 
             time.sleep(POLL_S)
 
     def _check_config_reload(self):
         """Hot-reload voice/speed from state file if changed (Kokoro only)."""
+        try:
+            st = os.stat(STATE_FILE)
+            mtime = st.st_mtime
+        except OSError:
+            return
+        if mtime == self._state_mtime:
+            return
+        self._state_mtime = mtime
         state = load_state()
 
         # Provider changes require restart — skip hot-reload
@@ -723,18 +626,16 @@ class ShadowCompanion:
                 print(f"  🔄 Speed changed: {self.speed} → {state.get('speed', 1.0)}")
                 self.speed = state.get("speed", 1.0)
 
-            self.pipe = self._build_pipeline(
-                config={
-                    "voice": self.voice,
-                    "provider": state.get("provider", self.provider),
-                    "generation": {"speed": self.speed},
-                },
-                eager=True,
-            )
-            print(f"  ✓ Config updated\n")
+            if self._worker_proc is not None and self._worker_proc.poll() is None:
+                self._kill_worker()
+                print("  TTS worker will restart with new config on next utterance")
+            else:
+                print(f"  ✓ Config updated (worker not running)\n")
 
     def run(self):
         """Start watching DB — uses kqueue if available, else polling."""
+        unloader = threading.Thread(target=self._idle_unloader, daemon=True)
+        unloader.start()
         try:
             import select
             if hasattr(select, 'kqueue') and hasattr(select, 'KQ_FILTER_VNODE'):
@@ -747,7 +648,7 @@ class ShadowCompanion:
 
     def stop(self):
         self.running = False
-        self._sd.stop()
+        self._kill_worker()
         state = load_state()
         state["running"] = False
         save_state(state)
@@ -877,8 +778,6 @@ def _run_server():
         speed=state.get("speed", 1.0),
         provider=provider,
         db_path=db_path,
-        ref_audio=REF_VOICE_WAV if provider == "neutts" else None,
-        ref_text=None,
     )
 
     # Write initial daily progress
@@ -989,6 +888,440 @@ def _setup_voice():
     print("   python shadow.py restart")
 
 
+# ── Reference encoder subprocess ────────────────────────────────────
+
+REF_CODES_FILE = STATE_DIR / "ref_codes.npy"
+
+
+def _encode_ref_subprocess():
+    """Short-lived subprocess: load torch + PyTorch codec, encode reference
+    audio, save ref_codes.npy, exit. OS reclaims ALL torch memory on exit."""
+    ref_audio = REF_VOICE_WAV
+    ref_text_path = REF_VOICE_TXT
+    if not ref_audio.exists():
+        print(f"No reference audio at {ref_audio}")
+        sys.exit(1)
+    ref_text = None
+    if ref_text_path and ref_text_path.exists():
+        ref_text = ref_text_path.read_text().strip()
+    if not ref_text:
+        print(f"No reference text at {ref_text_path}")
+        sys.exit(1)
+
+    # Load torch + codec encoder (this is the expensive part)
+    from neutts import NeuTTS
+    neutts = NeuTTS(
+        backbone_repo="neuphonic/neutts-air-q8-gguf",
+        backbone_device="cpu",
+        codec_repo="neuphonic/neucodec",
+        codec_device="cpu",
+    )
+    print("Encoding reference audio...")
+    ref_codes = neutts.encode_reference(str(ref_audio))
+
+    # Save to disk — torch not needed after this
+    import numpy as np
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    np.save(str(REF_CODES_FILE), ref_codes.numpy() if hasattr(ref_codes, 'numpy') else np.array(ref_codes))
+    print(f"Reference codes saved to {REF_CODES_FILE}")
+
+    # Also save ref_text for the worker to pick up
+    (STATE_DIR / "ref_text.txt").write_text(ref_text)
+    print("Encoder subprocess done — torch memory will be reclaimed on exit")
+
+
+# ── TTS worker subprocess ──────────────────────────────────────────
+
+def _tts_worker_main():
+    """Internal: TTS worker subprocess. Reads text lines from stdin,
+    generates audio, plays it. All heavy model memory is isolated here
+    so killing this process frees ALL RAM instantly."""
+    # Handle SIGTERM gracefully — stop audio and exit
+    import numpy as np
+    import sounddevice as sd
+    _worker_shutdown = False
+
+    def _worker_sigterm(sig, frame):
+        nonlocal _worker_shutdown
+        _worker_shutdown = True
+        try:
+            sd.stop()
+        except Exception:
+            pass
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, _worker_sigterm)
+
+    state = load_state()
+    provider = state.get("provider", "kokoro")
+    voice = state.get("voice", "am_michael")
+    speed = state.get("speed", 1.0)
+
+    # Load models (this is where the RAM goes)
+    if provider == "kokoro":
+        from pykokoro import build_pipeline, PipelineConfig
+        from pykokoro.generation_config import GenerationConfig
+        from pykokoro.stages.doc_parsers.ssmd import SsmdDocumentParser
+        from pykokoro.stages.g2p.kokorog2p import KokoroG2PAdapter
+        from pykokoro.stages.phoneme_processing.onnx import OnnxPhonemeProcessorAdapter
+        from pykokoro.stages.audio_generation.onnx import OnnxAudioGenerationAdapter
+        from pykokoro.stages.audio_postprocessing.onnx import OnnxAudioPostprocessingAdapter
+        from pykokoro.runtime.tracing import Trace
+        from pykokoro.constants import SAMPLE_RATE
+        from pykokoro.types import Segment
+        from dataclasses import replace as dc_replace
+
+        print(f"Loading Kokoro model (voice={voice})...")
+        pipe = build_pipeline(
+            config={"voice": voice, "provider": provider, "generation": {"speed": speed}},
+            eager=True,
+        )
+        print("Pre-warming TTS engine...")
+        pipe.run("Ready.")
+        print("Kokoro ready")
+
+    elif provider == "neutts":
+        import soundfile as sf
+
+        # ── Torch-free NeuTTS path ──────────────────────────────────
+        # Strategy: load ref_codes from disk (encoded in a separate short-lived
+        # subprocess that loaded torch, encoded, saved, exited → OS reclaimed torch).
+        # The worker only needs llama_cpp (GGUF backbone) + onnxruntime (codec decoder)
+        # + phonemizer — no torch/transformers at all.
+
+        # Check ref_codes exist
+        if not REF_CODES_FILE.exists():
+            print(f"No reference codes at {REF_CODES_FILE}")
+            print(f"Run: python shadow.py _encode_ref")
+            sys.exit(1)
+
+        ref_text_path = STATE_DIR / "ref_text.txt"
+        if not ref_text_path.exists():
+            print(f"No reference text at {ref_text_path}")
+            sys.exit(1)
+        ref_text = ref_text_path.read_text().strip()
+
+        # Load pre-computed reference codes (numpy, no torch needed)
+        ref_codes = np.load(str(REF_CODES_FILE))
+        print(f"Loaded reference codes: shape={ref_codes.shape}")
+
+        # ── Stub out heavy deps BEFORE any import that touches them ───
+        # neutts.py and neucodec/model.py do `import torch` at module level.
+        # We replace torch/transformers/torchaudio with stubs so those imports
+        # succeed without loading the real 237 MB libtorch.
+        import types
+
+        # Stub base class (neucodec.model.py: class NeuCodec(nn.Module))
+        class _StubModule:
+            def __init__(self, *a, **kw): pass
+            def eval(self): return self
+            def to(self, *a, **kw): return self
+            def __call__(self, *a, **kw): return None
+
+        def _make_torch_stub():
+            """Create a torch module stub that supports the subset used by
+            neucodec.model.py, neutts.neutts.py, and huggingface_hub at import time."""
+            t = types.ModuleType('torch')
+            nn_stub = types.ModuleType('torch.nn')
+            nn_stub.Module = _StubModule
+            nn_stub.functional = types.ModuleType('torch.nn.functional')
+            nn_stub.functional.pad = lambda *a, **kw: None
+            # torch.nn.utils (neucodec/module.py: from torch.nn.utils import weight_norm)
+            nn_utils = types.ModuleType('torch.nn.utils')
+            nn_utils.weight_norm = lambda x: x
+            nn_stub.utils = nn_utils
+            # Common nn layers used at class-def time in neucodec
+            nn_stub.Linear = _StubModule
+            nn_stub.Conv1d = _StubModule
+            nn_stub.Conv2d = _StubModule
+            nn_stub.ConvTranspose1d = _StubModule
+            nn_stub.Embedding = _StubModule
+            nn_stub.Sequential = _StubModule
+            nn_stub.ModuleList = _StubModule
+            nn_stub.Parameter = lambda *a, **kw: None
+            t.nn = nn_stub
+            t.Tensor = _StubModule
+            t.device = lambda x: x
+            t.no_grad = lambda: type('ctx', (), {'__enter__': lambda s: None, '__exit__': lambda s, *a: None})()
+            t.from_numpy = lambda x: x
+            t.tensor = lambda *a, **kw: None
+            t.load = lambda *a, **kw: {}
+            t.vstack = lambda *a, **kw: None
+            t.cat = lambda *a, **kw: None
+            t.nn.functional = nn_stub.functional
+            # Dtype constants (needed by huggingface_hub.serialization._torch)
+            t.int64 = int
+            t.int32 = int
+            t.float16 = float
+            t.float32 = float
+            t.float64 = float
+            t.bfloat16 = float
+            t.bool = bool
+            t.uint8 = int
+            t.int8 = int
+            t.int16 = int
+            t.complex64 = complex
+            t.complex128 = complex
+            return t
+
+        _torch_stub = _make_torch_stub()
+        sys.modules['torch'] = _torch_stub
+        sys.modules['torch.nn'] = _torch_stub.nn
+        sys.modules['torch.nn.functional'] = _torch_stub.nn.functional
+        sys.modules['torch.nn.utils'] = _torch_stub.nn.utils
+
+        # torchaudio stub
+        _torchaudio_stub = types.ModuleType('torchaudio')
+        _torchaudio_stub.transforms = types.ModuleType('torchaudio.transforms')
+        sys.modules['torchaudio'] = _torchaudio_stub
+        sys.modules['torchaudio.transforms'] = _torchaudio_stub.transforms
+
+        # transformers stub
+        _transformers_stub = types.ModuleType('transformers')
+        _transformers_stub.AutoTokenizer = type('AutoTokenizer', (), {'from_pretrained': staticmethod(lambda *a, **kw: None)})
+        _transformers_stub.AutoModelForCausalLM = type('AutoModelForCausalLM', (), {'from_pretrained': staticmethod(lambda *a, **kw: None)})
+        _transformers_stub.AutoFeatureExtractor = type('AutoFeatureExtractor', (), {'from_pretrained': staticmethod(lambda *a, **kw: None)})
+        _transformers_stub.HubertModel = _StubModule
+        _transformers_stub.Wav2Vec2BertModel = _StubModule
+        sys.modules['transformers'] = _transformers_stub
+        for sub in ['models', 'models.auto']:
+            sys.modules[f'transformers.{sub}'] = types.ModuleType(f'transformers.{sub}')
+
+        # Pre-stub huggingface_hub to prevent it from trying to use torch
+        # during lazy import of hub_mixin. Must happen BEFORE neucodec import
+        # because neucodec/model.py does `from huggingface_hub import PyTorchModelHubMixin, ModelHubMixin`.
+        import huggingface_hub as _hf
+        if not hasattr(_hf, 'PyTorchModelHubMixin'):
+            _hf.PyTorchModelHubMixin = _StubModule
+        if not hasattr(_hf, 'ModelHubMixin'):
+            _hf.ModelHubMixin = _StubModule
+        # Ensure the lazy-import submodules are also pre-loaded
+        if 'huggingface_hub.hub_mixin' not in sys.modules:
+            _hm = types.ModuleType('huggingface_hub.hub_mixin')
+            _hm.PyTorchModelHubMixin = _StubModule
+            _hm.ModelHubMixin = _StubModule
+            sys.modules['huggingface_hub.hub_mixin'] = _hm
+
+        # ── Load NeuCodecOnnxDecoder WITHOUT importing the neucodec package ───
+        # The neucodec package drags in torch at module level via its __init__.py
+        # which imports NeuCodec (torch-dependent). Instead, we create a minimal
+        # class that does exactly what NeuCodecOnnxDecoder does: load an ONNX
+        # session from a HuggingFace cache path.
+        import onnxruntime
+        from huggingface_hub import hf_hub_download
+
+        class _NeuCodecOnnxDecoder:
+            """Torch-free ONNX codec decoder. Reimplements neucodec.NeuCodecOnnxDecoder
+            without the torch-dependent import chain."""
+            def __init__(self, onnx_path):
+                so = onnxruntime.SessionOptions()
+                so.graph_optimization_level = onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
+                self.session = onnxruntime.InferenceSession(onnx_path, sess_options=so)
+                self.sample_rate = 24_000
+
+            def decode_code(self, codes: np.ndarray) -> np.ndarray:
+                if not isinstance(codes, np.ndarray):
+                    raise ValueError("Codes should be an np.array.")
+                if not len(codes.shape) == 3 or codes.shape[1] != 1:
+                    raise ValueError("Codes should be of shape [B, 1, F].")
+                return self.session.run(None, {"codes": codes})[0].astype(np.float32)
+
+            @classmethod
+            def from_pretrained(cls, model_id: str, **kwargs):
+                onnx_path = hf_hub_download(repo_id=model_id, filename="model.onnx", **kwargs)
+                # Download meta.yaml for download tracking (same as upstream)
+                try:
+                    hf_hub_download(repo_id=model_id, filename="meta.yaml", **kwargs)
+                except Exception:
+                    pass
+                return cls(onnx_path)
+
+        # Stub the neucodec package so neutts can import it if needed
+        _neucodec_stub = types.ModuleType('neucodec')
+        _neucodec_stub.NeuCodecOnnxDecoder = _NeuCodecOnnxDecoder
+        _neucodec_stub.NeuCodec = _StubModule
+        _neucodec_stub.DistillNeuCodec = _StubModule
+        sys.modules['neucodec'] = _neucodec_stub
+
+        # Now safe to import neutts (it may import neucodec, but gets our stub)
+        from neutts import NeuTTS
+
+        # Disable mlock — let OS swap out model when memory-pressured
+        import llama_cpp
+        _orig_llama_init = llama_cpp.Llama.__init__
+        def _patched_init(self_llama, *args, **kwargs):
+            kwargs['mlock'] = False
+            return _orig_llama_init(self_llama, *args, **kwargs)
+        llama_cpp.Llama.__init__ = _patched_init
+
+        # Load NeuTTS with ONNX codec from the start (no PyTorch codec)
+        print("Loading NeuTTS Air Q8 + ONNX codec (torch-free)...")
+        neutts = NeuTTS(
+            backbone_repo="neuphonic/neutts-air-q8-gguf",
+            backbone_device="cpu",
+            codec_repo="neuphonic/neucodec-onnx-decoder",
+            codec_device="cpu",
+        )
+        llama_cpp.Llama.__init__ = _orig_llama_init
+
+        print("Pre-warming TTS engine...")
+        neutts.infer("Ready.", ref_codes, ref_text)
+        print("NeuTTS ready (torch-free)")
+
+    print("WORKER_READY")  # Signal to parent that models are loaded
+    sys.stdout.flush()
+
+    # Main loop: read text from stdin, speak it
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            payload = json.loads(line)
+            text = payload.get("text", "").strip()
+        except (json.JSONDecodeError, KeyError):
+            text = line  # fallback: raw text
+
+        if not text:
+            continue
+        if len(text) > 500:
+            text = text[:500] + "..."
+
+        try:
+            if provider == "kokoro":
+                _speak_kokoro_in_worker(pipe, np, sd, text, SsmdDocumentParser, KokoroG2PAdapter,
+                    OnnxPhonemeProcessorAdapter, OnnxAudioGenerationAdapter,
+                    OnnxAudioPostprocessingAdapter, Trace, SAMPLE_RATE, Segment)
+            elif provider == "neutts":
+                _speak_neutts_in_worker(neutts, np, sd, ref_codes, ref_text, text)
+        except Exception as e:
+            print(f"TTS error: {e}")
+
+        sys.stdout.flush()
+
+
+def _speak_kokoro_in_worker(pipe, np, sd, text, SsmdDocumentParser, KokoroG2PAdapter,
+                            OnnxPhonemeProcessorAdapter, OnnxAudioGenerationAdapter,
+                            OnnxAudioPostprocessingAdapter, Trace, SAMPLE_RATE, Segment):
+    """Kokoro TTS playback (runs in worker subprocess)."""
+    config = pipe.config
+    trace = Trace()
+
+    doc = SsmdDocumentParser().parse(text, config, trace)
+    segments = doc.segments
+    if not segments and doc.clean_text:
+        segments = [Segment(
+            id="p0_s0_c0_seg0", text=doc.clean_text,
+            char_start=0, char_end=len(doc.clean_text),
+            paragraph_idx=0, sentence_idx=0, clause_idx=0,
+        )]
+    phoneme_segments = KokoroG2PAdapter().phonemize(segments, doc, config, trace)
+
+    # Fast path: single segment
+    if len(phoneme_segments) <= 1:
+        res = pipe.run(text)
+        if res.audio is None or len(res.audio) == 0:
+            return
+        audio = res.audio.astype(np.float32) if hasattr(res.audio, 'astype') else np.array(res.audio, dtype=np.float32)
+        duration = len(audio) / res.sample_rate
+        sd.play(audio, res.sample_rate)
+        sd.wait()
+        log_tts_play(duration)
+        print(f"{duration:.1f}s played")
+        return
+
+    # Streaming path: multiple segments
+    kokoro, _ = pipe._ensure_kokoro(config)
+    pp = OnnxPhonemeProcessorAdapter(kokoro)
+    phoneme_segments = pp.process(phoneme_segments, config, trace)
+    ag = OnnxAudioGenerationAdapter(kokoro)
+    ap = OnnxAudioPostprocessingAdapter(kokoro)
+
+    total_duration = 0.0
+    for seg in phoneme_segments:
+        seg_result = ag.generate([seg], config, trace)
+        audio = ap.postprocess(seg_result, config, trace)
+        if audio is not None and len(audio) > 0:
+            audio_f32 = audio.astype(np.float32)
+            dur = len(audio_f32) / SAMPLE_RATE
+            total_duration += dur
+            sd.wait()
+            sd.play(audio_f32, SAMPLE_RATE)
+
+    sd.wait()
+    if total_duration > 0:
+        log_tts_play(total_duration)
+        print(f"{total_duration:.1f}s played")
+
+
+def _speak_neutts_in_worker(neutts, np, sd, ref_codes, ref_text, text):
+    """NeuTTS streaming playback (runs in worker subprocess)."""
+    import queue as _queue
+
+    sample_rate = neutts.sample_rate  # 24000
+    chunk_queue = _queue.Queue()
+
+    buf = np.zeros(0, dtype=np.float32)
+    buf_offset = 0
+    got_sentinel = False
+
+    def _callback(outdata, frames, time_info, status):
+        nonlocal buf, buf_offset, got_sentinel
+        if got_sentinel:
+            outdata[:] = 0
+            raise sd.CallbackStop
+        written = 0
+        while written < frames:
+            avail = len(buf) - buf_offset
+            if avail > 0:
+                n = min(avail, frames - written)
+                outdata[written:written + n, 0] = buf[buf_offset:buf_offset + n]
+                buf_offset += n
+                written += n
+            else:
+                try:
+                    chunk = chunk_queue.get(timeout=2.0)
+                except _queue.Empty:
+                    outdata[written:, 0] = 0.0
+                    return
+                if chunk is None:  # sentinel
+                    got_sentinel = True
+                    outdata[written:, 0] = 0.0
+                    raise sd.CallbackStop
+                buf = chunk
+                buf_offset = 0
+
+    stream = sd.OutputStream(
+        samplerate=sample_rate, channels=1, dtype='float32',
+        callback=_callback, blocksize=1024,
+    )
+    stream.start()
+
+    total_samples = 0
+    for chunk in neutts.infer_stream(text, ref_codes, ref_text):
+        if chunk is not None and len(chunk) > 0:
+            audio = chunk.astype(np.float32)
+            chunk_queue.put(audio)
+            total_samples += len(audio)
+
+    # Tail padding + sentinel
+    chunk_queue.put(np.zeros(int(0.15 * sample_rate), dtype=np.float32))
+    chunk_queue.put(None)
+
+    total_duration = total_samples / sample_rate
+    timeout = max(total_duration + 5, 10)
+    deadline = time.monotonic() + timeout
+    while stream.active and time.monotonic() < deadline:
+        time.sleep(0.05)
+
+    stream.stop()
+    stream.close()
+
+    if total_duration > 0:
+        log_tts_play(total_duration)
+        print(f"{total_duration:.1f}s played")
+
+
 # ── CLI ───────────────────────────────────────────────────────────
 
 def main():
@@ -1028,12 +1361,24 @@ def main():
 
     # Internal
     sub.add_parser("_run_server", help=argparse.SUPPRESS)
+    sub.add_parser("_tts_worker", help=argparse.SUPPRESS)
+    sub.add_parser("_encode_ref", help=argparse.SUPPRESS)
 
     args = parser.parse_args()
 
     # Internal server command
     if args.command == "_run_server":
         _run_server()
+        return
+
+    # Internal TTS worker subprocess
+    if args.command == "_tts_worker":
+        _tts_worker_main()
+        return
+
+    # Internal: encode reference in short-lived subprocess
+    if args.command == "_encode_ref":
+        _encode_ref_subprocess()
         return
 
     # Server management commands
@@ -1147,8 +1492,6 @@ def main():
         speed=args.speed,
         provider=args.provider,
         db_path=db_path,
-        ref_audio=REF_VOICE_WAV if args.provider == "neutts" else None,
-        ref_text=None,
     )
 
     def handle_sigint(sig, frame):

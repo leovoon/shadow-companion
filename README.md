@@ -13,6 +13,13 @@ Supports two TTS providers:
 - **Kokoro** — Built-in voices, adjustable speed, fast startup
 - **NeuTTS Air** — Voice cloning from your own reference audio, streaming playback
 
+### Subprocess worker architecture
+
+TTS runs in a child process for full memory reclamation:
+- Models load lazily on first utterance (not at startup)
+- After 10 minutes idle, the worker is killed — the OS reclaims **all** model memory instantly
+- For NeuTTS, torch is only loaded briefly in a short-lived encoder subprocess (to produce `ref_codes.npy`), then exits. The long-lived worker uses the ONNX codec + GGUF backbone — no torch at all (~1.5 GB vs ~3 GB)
+
 ## Prerequisites
 
 - **macOS** 13+ (kqueue for DB watching, Perry for menubar)
@@ -119,6 +126,8 @@ Then restart: `python shadow.py restart`
 - Speed control is not available with NeuTTS
 - Provider changes require a server restart
 - Only GGUF backbones are supported for streaming (Q8 by default)
+- Voice cloning reference is encoded in a separate short-lived subprocess that loads torch, saves `ref_codes.npy`, then exits — the long-lived TTS worker never loads torch
+- The ONNX codec decoder (`neuphonic/neucodec-onnx-decoder`) is used in the worker instead of the PyTorch codec, saving ~2.4 GB of resident memory
 
 ## Daily Tracking
 
@@ -224,7 +233,7 @@ Four commands available:
 
 ## Troubleshooting
 
-**CoreML slow on M2:** Use `--provider cpu` (default) — it's actually faster (~4-5× realtime) because CoreML only supports ~45% of Kokoro's ONNX nodes, causing graph partitioning overhead.
+**CoreML slow on M2:** Use `--provider kokoro` (default) — it uses the CPU ONNX path which is faster (~4-5× realtime) because CoreML only supports ~45% of Kokoro's ONNX nodes, causing graph partitioning overhead.
 
 **NeuTTS audio choppy:** Fixed — streaming now uses `sounddevice.OutputStream` with a queue-based callback for gapless chunk playback. If issues persist, check that `llama-cpp-python` and `onnxruntime` are up to date.
 
@@ -232,6 +241,6 @@ Four commands available:
 
 **Server not responding:** Check the log at `~/.shadow-companion/server.log`
 
-**Menubar shows stale data:** Run `python shadow.py progress` to recompute, or just wait — the server updates on every new recording.
+**Menubar shows stale data:** Run `python shadow.py progress` to recompute, or just wait — the server refreshes progress on every new recording and every 5 minutes.
 
 **NeuTTS reference audio missing:** Run `python shadow.py setup-voice` to record your reference audio. Or place a WAV file at `~/.shadow-companion/my-voice.wav` with a matching `.txt` transcript.

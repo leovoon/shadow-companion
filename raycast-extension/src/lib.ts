@@ -1,5 +1,5 @@
 import { execSync } from "child_process";
-import { readFileSync } from "fs";
+import { existsSync, readFileSync } from "fs";
 import path from "path";
 
 const SHADOW_DIR = path.join(process.env.HOME || "~", "shadow-companion");
@@ -61,8 +61,17 @@ export function getProgress(): DailyProgress | null {
 }
 
 export function isRunning(): boolean {
-  const result = runShadowCommand("status");
-  return result.includes("🟢");
+  try {
+    const pidPath = path.join(process.env.HOME || "~", ".shadow-companion", "server.pid");
+    if (!existsSync(pidPath)) return false;
+    const pid = parseInt(readFileSync(pidPath, "utf-8").trim(), 10);
+    if (isNaN(pid)) return false;
+    // signal 0 throws if PID doesn't exist
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 export const VOICES = [
