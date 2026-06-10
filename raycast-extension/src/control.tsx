@@ -1,6 +1,12 @@
 import { List, ActionPanel, Action, Icon, Color, showToast, Toast } from "@raycast/api";
 import { useState, useEffect } from "react";
+import { execSync } from "child_process";
+import { existsSync } from "fs";
+import path from "path";
 import { isRunning, runShadowCommand, getState, getProgress } from "./lib";
+
+const SHADOW_DIR = path.join(process.env.HOME || "~", "shadow-companion");
+const METER_APP = path.join(SHADOW_DIR, "dist", "Shadow Meter.app");
 
 const VOICE_MAP: Record<string, string> = {
   am_michael: "Michael",
@@ -92,6 +98,30 @@ export default function Command() {
     }
   };
 
+  const meterInstalled = existsSync(METER_APP);
+  const meterRunning = (() => {
+    try {
+      const result = execSync('pgrep -x shadow-meter', { encoding: 'utf-8' }).trim();
+      return result.length > 0;
+    } catch {
+      return false;
+    }
+  })();
+
+  const handleStartMeter = async () => {
+    if (!meterInstalled) return;
+    const toast = await showToast({ style: Toast.Style.Animated, title: "Starting Shadow Meter..." });
+    try {
+      execSync(`open "${METER_APP}"`);
+      toast.style = Toast.Style.Success;
+      toast.title = "📊 Shadow Meter started";
+    } catch (e) {
+      toast.style = Toast.Style.Failure;
+      toast.title = "Failed to start Shadow Meter";
+      toast.message = e instanceof Error ? e.message : String(e);
+    }
+  };
+
   const handleRestart = async () => {
     const toast = await showToast({ style: Toast.Style.Animated, title: "Restarting Shadow Companion..." });
     try {
@@ -151,6 +181,22 @@ export default function Command() {
             title="Completion"
             accessories={[{ text: `${progress.pct}%` }]}
             icon={progress.pct >= 100 ? { source: Icon.Checkmark, tintColor: Color.Green } : Icon.Chart}
+          />
+        </List.Section>
+      )}
+
+      {meterInstalled && (
+        <List.Section title="Progress Tracker">
+          <List.Item
+            id="meter"
+            title="Shadow Meter"
+            accessories={[{ text: meterRunning ? "🟢 Running" : "🔴 Stopped" }]}
+            icon={Icon.Chart}
+            actions={
+              <ActionPanel>
+                {!meterRunning && <Action title="Start Shadow Meter" onAction={handleStartMeter} />}
+              </ActionPanel>
+            }
           />
         </List.Section>
       )}
