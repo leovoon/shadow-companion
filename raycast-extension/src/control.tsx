@@ -69,10 +69,19 @@ export default function Command() {
     return () => clearInterval(interval);
   }, []);
 
+  const startMeterIfInstalled = () => {
+    if (existsSync(METER_APP)) {
+      try { execSync('pgrep -x shadow-meter', { encoding: 'utf-8' }); } catch {
+        try { execSync(`open "${METER_APP}"`); } catch { /* ignore */ }
+      }
+    }
+  };
+
   const handleStart = async () => {
     const toast = await showToast({ style: Toast.Style.Animated, title: "Starting Shadow Companion..." });
     try {
       runShadowCommand("serve");
+      startMeterIfInstalled();
       toast.style = Toast.Style.Success;
       toast.title = "🦭 Shadow Companion started";
       toast.message = `${provider === "neutts" ? "NeuTTS voice cloning" : "Kokoro streaming"} playback`;
@@ -126,6 +135,7 @@ export default function Command() {
     const toast = await showToast({ style: Toast.Style.Animated, title: "Restarting Shadow Companion..." });
     try {
       runShadowCommand("restart");
+      startMeterIfInstalled();
       toast.style = Toast.Style.Success;
       toast.title = "🦭 Shadow Companion restarted";
       setRunning(true);
