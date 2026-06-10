@@ -152,6 +152,44 @@ export default function Command() {
 
   return (
     <List>
+      <List.Section title="Server Control">
+        {!running ? (
+          <List.Item
+            id="start"
+            title="Start Server"
+            icon={{ source: Icon.Play, tintColor: Color.Green }}
+            actions={
+              <ActionPanel>
+                <Action title="Start" onAction={handleStart} />
+              </ActionPanel>
+            }
+          />
+        ) : (
+          <>
+            <List.Item
+              id="stop"
+              title="Stop Server"
+              icon={{ source: Icon.Stop, tintColor: Color.Red }}
+              actions={
+                <ActionPanel>
+                  <Action title="Stop" onAction={handleStop} />
+                </ActionPanel>
+              }
+            />
+            <List.Item
+              id="restart"
+              title="Restart Server"
+              icon={{ source: Icon.ArrowClockwise, tintColor: Color.Blue }}
+              actions={
+                <ActionPanel>
+                  <Action title="Restart" onAction={handleRestart} />
+                </ActionPanel>
+              }
+            />
+          </>
+        )}
+      </List.Section>
+
       <List.Section title="Status">
         <List.Item
           id="status"
@@ -210,44 +248,6 @@ export default function Command() {
           />
         </List.Section>
       )}
-
-      <List.Section title="Actions">
-        {!running ? (
-          <List.Item
-            id="start"
-            title="Start Server"
-            icon={{ source: Icon.Play, tintColor: Color.Green }}
-            actions={
-              <ActionPanel>
-                <Action title="Start" onAction={handleStart} />
-              </ActionPanel>
-            }
-          />
-        ) : (
-          <>
-            <List.Item
-              id="stop"
-              title="Stop Server"
-              icon={{ source: Icon.Stop, tintColor: Color.Red }}
-              actions={
-                <ActionPanel>
-                  <Action title="Stop" onAction={handleStop} />
-                </ActionPanel>
-              }
-            />
-            <List.Item
-              id="restart"
-              title="Restart Server"
-              icon={{ source: Icon.ArrowClockwise, tintColor: Color.Blue }}
-              actions={
-                <ActionPanel>
-                  <Action title="Restart" onAction={handleRestart} />
-                </ActionPanel>
-              }
-            />
-          </>
-        )}
-      </List.Section>
     </List>
   );
 }
