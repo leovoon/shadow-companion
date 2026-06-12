@@ -412,9 +412,23 @@ class ShadowCompanion:
         python = str(venv_python) if venv_python.exists() else sys.executable
         script = Path(__file__).resolve().as_posix()
 
+        # Rust worker: prefer if binary exists and provider is neutts
+        rust_binary = Path(__file__).parent / "tts-worker-rs" / "target" / "release" / "tts-worker"
+        use_rust = (
+            self.provider == "neutts"
+            and rust_binary.exists()
+            and os.environ.get("SHADOW_RUST_TTS", "1") != "0"
+        )
+
+        if use_rust:
+            worker_argv = [str(rust_binary)]
+            print("  🦀 TTS worker (rust) loading models...")
+        else:
+            worker_argv = [python, "-u", script, "_tts_worker"]
+
         self._worker_ready.clear()
         self._worker_proc = subprocess.Popen(
-            [python, "-u", script, "_tts_worker"],
+            worker_argv,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,

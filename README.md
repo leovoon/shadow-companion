@@ -20,6 +20,22 @@ TTS runs in a child process for full memory reclamation:
 - After 10 minutes idle, the worker is killed — the OS reclaims **all** model memory instantly
 - For NeuTTS, torch is only loaded briefly in a short-lived encoder subprocess (to produce `ref_codes.npy`), then exits. The long-lived worker uses the ONNX codec + GGUF backbone — no torch at all (~1.5 GB vs ~3 GB)
 
+### Rust TTS Worker (NeuTTS)
+
+NeuTTS inference runs in a native Rust binary by default — faster cold start (~5s vs tens of seconds), lower memory, no Python interpreter overhead. The Rust worker is a drop-in replacement for the Python worker subprocess; `shadow.py` automatically uses it when the binary exists and the provider is `neutts`.
+
+- **Default:** Rust binary (`tts-worker-rs/target/release/tts-worker`) is used when present
+- **Fallback:** If the binary is missing or `SHADOW_RUST_TTS=0` is set, the Python worker runs instead
+- **Kokoro** always uses the Python worker (not affected)
+
+Build the Rust worker:
+
+```bash
+cd tts-worker-rs && cargo build --release
+```
+
+Requires: Rust 1.94+, CMake (for llama.cpp vendored build). First build takes a few minutes; subsequent builds are fast.
+
 ## Prerequisites
 
 - **macOS** 13+ (kqueue for DB watching, Perry for menubar)
